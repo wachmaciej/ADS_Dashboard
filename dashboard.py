@@ -3,12 +3,16 @@ import pandas as pd
 import warnings
 import plotly.express as px
 import datetime
+import calendar
+from plotly.subplots import make_subplots
+import plotly.graph_objects as go
+import re
 
 # Filter warnings for a clean output
 warnings.filterwarnings("ignore")
 
 # --- Page Configuration ---
-st.set_page_config(page_title="YOY Dashboard", page_icon=":bar_chart:", layout="wide")
+st.set_page_config(page_title="YOY Dashboard", page_icon=":chart_with_upwards_trend:", layout="wide")
 
 # --- Custom CSS (Optional) ---
 st.markdown(
@@ -26,28 +30,17 @@ st.markdown(
 # --- Title and Logo ---
 col1, col2 = st.columns([3, 1])
 with col1:
-    st.title("YOY Dashboard")
+    st.title("YOY Dashboard 📊")
 with col2:
     st.image("logo.png", width=300)
 
-# --- File Upload in Sidebar ---
-sap_file = st.sidebar.file_uploader(
-    "SAP Data Uploader: Upload your SAP CSV or Excel file", 
-    type=["csv", "xlsx"]
-)
-if sap_file is None:
-    st.sidebar.info("Please upload SAP data to view the dashboard.")
-    st.stop()
+# --- Sidebar Uploaders ---
+uploaded_file = st.sidebar.file_uploader("Upload Main Dataset (CSV or Excel)", type=["csv", "xlsx"])
+advertising_file = st.sidebar.file_uploader("Upload Advertising Data (CSV or Excel)", type=["csv", "xlsx"])
 
-ads_file = st.sidebar.file_uploader(
-    "ADs Data Uploader (Optional): Upload your ADs CSV or Excel file", 
-    type=["csv", "xlsx"]
-)
-# If ADs data is not provided, we set ads_df to None
-if ads_file is not None:
-    ads_df = None  # will be loaded later
-else:
-    ads_df = None
+if uploaded_file is None:
+    st.info("Please use the file uploader in the sidebar to upload your main dataset and view the dashboard.")
+    st.stop()
 
 # =============================================================================
 # FUNCTIONS
@@ -55,19 +48,47 @@ else:
 
 @st.cache_data(show_spinner=False)
 def load_data(file):
-    """
-    Load data from CSV or Excel file.
-    """
+    """Load main data from CSV or Excel file."""
     if file.name.endswith(".csv"):
         data = pd.read_csv(file)
     else:
         data = pd.read_excel(file)
     return data
 
+@st.cache_data(show_spinner=False)
+def load_ad_data(file):
+    """Load advertising data from CSV or Excel file and preprocess it."""
+    if file.name.endswith(".csv"):
+        data = pd.read_csv(file)
+    else:
+        data = pd.read_excel(file)
+    
+    data.columns = data.columns.str.strip()
+    for col in ["Start Date", "End Date"]:
+        if col in data.columns:
+            data[col] = pd.to_datetime(data[col], errors='coerce')
+    currency_columns = ["Budget Amount", "Spend", "Last Year Spend", "7 Day Total Sales"]
+    for col in currency_columns:
+        if col in data.columns:
+            data[col] = (data[col]
+                         .astype(str)
+                         .str.replace(r'[\$,]', '', regex=True)
+                         .str.strip()
+                         .replace('', '0')
+                         .astype(float))
+    if "Total Advertising Cost of Sales (ACOS)" in data.columns:
+        data["Total Advertising Cost of Sales (ACOS)"] = (
+            data["Total Advertising Cost of Sales (ACOS)"]
+            .astype(str)
+            .str.replace('%', '', regex=False)
+            .str.strip()
+            .replace('', '0')
+            .astype(float)
+        )
+    return data
+
 def get_quarter(week):
-    """
-    Convert week number to quarter.
-    """
+    """Convert week number to quarter."""
     if 1 <= week <= 13:
         return "Q1"
     elif 14 <= week <= 26:
@@ -80,36 +101,49 @@ def get_quarter(week):
         return None
 
 def format_currency(value):
-    """
-    Format number as currency.
-    """
+    """Format number as currency with two decimals."""
     return f"£{value:,.2f}"
+
+def format_currency_int(value):
+    """Format number as currency without decimals."""
+    return f"£{int(round(value)):,}"
 
 @st.cache_data(show_spinner=False)
 def preprocess_data(data):
-    """
-    Preprocess data by ensuring necessary columns and adding Quarter column.
-    """
+    """Ensure necessary columns exist and add a 'Quarter' column."""
     required_cols = {"Week", "Year", "Sales Value (£)"}
     if not required_cols.issubset(set(data.columns)):
         st.error(f"Dataset is missing one or more required columns: {required_cols}")
         st.stop()
-    
     if "Week" in data.columns:
         data["Quarter"] = data["Week"].apply(get_quarter)
     return data
 
-# --- Helper Function: week_monday ---
 def week_monday(row):
-    """
-    Given a row with 'Year' and 'Week', return the Monday date of that ISO week.
-    """
+    """Return the Monday date of a given ISO week."""
     try:
         return datetime.date.fromisocalendar(int(row["Year"]), int(row["Week"]), 1)
     except Exception:
         return None
 
-def create_yoy_trends_chart(data, selected_years, selected_quarters, selected_channels=None, selected_listings=None, selected_products=None):
+def get_week_date_range(year, week):
+    """Return the Monday and Sunday dates for a given ISO week and year."""
+    try:
+        monday = datetime.date.fromisocalendar(year, week, 1)
+        sunday = datetime.date.fromisocalendar(year, week, 7)
+        return monday, sunday
+    except Exception:
+        return None, None
+
+# --- Updated YOY Trends Chart with x-axis left margin adjustment ---
+def create_yoy_trends_chart(data, selected_years, selected_quarters,
+                            selected_channels=None, selected_listings=None,
+                            selected_products=None, time_grouping="Week"):
+    """
+    Create a Plotly line chart for YOY Revenue Trends.
+    If time_grouping is "Week", groups by Year and Week;
+    if "Quarter", groups by Year and Quarter.
+    """
     filtered = data.copy()
     if selected_years:
         filtered = filtered[filtered["Year"].isin(selected_years)]
@@ -122,129 +156,71 @@ def create_yoy_trends_chart(data, selected_years, selected_quarters, selected_ch
     if selected_products and len(selected_products) > 0:
         filtered = filtered[filtered["Product"].isin(selected_products)]
     
-    weekly_rev = (
-        filtered.groupby(["Year", "Week"])["Sales Value (£)"]
-        .sum().reset_index().sort_values(by=["Year", "Week"])
-    )
-    weekly_rev["RevenueK"] = weekly_rev["Sales Value (£)"] / 1000
-    if not filtered.empty:
-        min_week, max_week = int(filtered["Week"].min()), int(filtered["Week"].max())
+    if time_grouping == "Week":
+        grouped = filtered.groupby(["Year", "Week"])["Sales Value (£)"].sum().reset_index()
+        x_col = "Week"
+        x_axis_label = "Week"
+        grouped = grouped.sort_values(by=["Year", "Week"])
+        title = "Weekly Revenue Trends by Year"
     else:
-        min_week, max_week = 1, 52
-
-    fig = px.line(
-        weekly_rev,
-        x="Week",
-        y="Sales Value (£)",
-        color="Year",
-        markers=True,
-        title="Weekly Revenue Trends by Year",
-        labels={"Sales Value (£)": "Revenue (£)"},
-        custom_data=["RevenueK"]
-    )
-    fig.update_traces(
-        hovertemplate="Week: %{x}<br>Revenue: %{customdata[0]:.1f}K"
-    )
-    fig.update_layout(
-        xaxis=dict(tickmode="linear", range=[min_week, max_week]),
-        margin=dict(t=50, b=50)
-    )
+        grouped = filtered.groupby(["Year", "Quarter"])["Sales Value (£)"].sum().reset_index()
+        x_col = "Quarter"
+        x_axis_label = "Quarter"
+        quarter_order = ["Q1", "Q2", "Q3", "Q4"]
+        grouped["Quarter"] = pd.Categorical(grouped["Quarter"], categories=quarter_order, ordered=True)
+        grouped = grouped.sort_values(by=["Year", "Quarter"])
+        title = "Quarterly Revenue Trends by Year"
+    
+    grouped["RevenueK"] = grouped["Sales Value (£)"] / 1000
+    fig = px.line(grouped, x=x_col, y="Sales Value (£)", color="Year", markers=True,
+                  title=title,
+                  labels={"Sales Value (£)": "Revenue (£)", x_col: x_axis_label},
+                  custom_data=["RevenueK"])
+    fig.update_traces(hovertemplate=f"{x_axis_label}: %{{x}}<br>Revenue: %{{customdata[0]:.1f}}K")
+    
+    # When grouping by week, adjust the x-axis range so that the first data point has a slight left margin.
+    if time_grouping == "Week":
+        # Instead of starting exactly at 1, start at 0.8 to add a little padding.
+        min_week = 0.8  
+        max_week = grouped["Week"].max() if not grouped["Week"].empty else 52
+        fig.update_xaxes(range=[min_week, max_week])
+    
+    fig.update_layout(margin=dict(t=50, b=50))
     return fig
 
-def create_sales_channel_chart(data, selected_years, selected_quarter):
+def create_pivot_table(data, selected_years, selected_quarters, selected_channels,
+                       selected_listings, selected_products, grouping_key="Listing"):
     filtered = data.copy()
     if selected_years:
         filtered = filtered[filtered["Year"].isin(selected_years)]
-    if selected_quarter != "All Quarters":
-        filtered = filtered[filtered["Quarter"] == selected_quarter]
-    
-    revenue = (filtered.groupby("Sales Channel")["Sales Value (£)"]
-               .sum().reset_index().sort_values(by="Sales Value (£)", ascending=False))
-    
-    fig = px.bar(
-        revenue,
-        x="Sales Channel",
-        y="Sales Value (£)",
-        text="Sales Value (£)",
-        title="Revenue by Sales Channel",
-        color_discrete_sequence=["#db53bb"],
-        labels={"Sales Value (£)": "Revenue (£)"}
-    )
-    fig.update_traces(texttemplate='%{text:.2s}', textposition='outside')
-    fig.update_layout(margin=dict(t=50, b=100))
-    return fig
-
-def create_listings_chart(data, selected_years, selected_quarters, selected_listings):
-    filtered = data.copy()
-    if selected_years:
-        filtered = filtered[filtered["Year"].isin(selected_years)]
-    if selected_quarters and "All Quarters" not in selected_quarters:
+    if selected_quarters:
         filtered = filtered[filtered["Quarter"].isin(selected_quarters)]
-    filtered = filtered[filtered["Listing"].isin(selected_listings)]
+    if selected_channels and len(selected_channels) > 0:
+        filtered = filtered[filtered["Sales Channel"].isin(selected_channels)]
+    if selected_listings and len(selected_listings) > 0:
+        filtered = filtered[filtered["Listing"].isin(selected_listings)]
+    if grouping_key == "Product" and selected_products and len(selected_products) > 0:
+        filtered = filtered[filtered["Product"].isin(selected_products)]
     
-    if len(selected_years) > 1:
-        weekly_listing = (filtered.groupby(["Listing", "Year", "Week"])
-                          .agg({"Sales Value (£)": "sum", "Order Quantity": "sum"})
-                          .reset_index().sort_values(by=["Listing", "Year", "Week"]))
-        weekly_listing.rename(columns={"Order Quantity": "UnitsSold"}, inplace=True)
-        weekly_listing["RevenueK"] = weekly_listing["Sales Value (£)"] / 1000
-        weekly_listing["Listing_Year"] = weekly_listing["Listing"] + " (" + weekly_listing["Year"].astype(str) + ")"
-        color_field = "Listing_Year"
-    else:
-        weekly_listing = (filtered.groupby(["Listing", "Week"])
-                          .agg({"Sales Value (£)": "sum", "Order Quantity": "sum"})
-                          .reset_index().sort_values(by=["Listing", "Week"]))
-        weekly_listing.rename(columns={"Order Quantity": "UnitsSold"}, inplace=True)
-        weekly_listing["RevenueK"] = weekly_listing["Sales Value (£)"] / 1000
-        color_field = "Listing"
-    
-    if selected_quarters and "All Quarters" not in selected_quarters and not filtered.empty:
-        min_week, max_week = int(filtered["Week"].min()), int(filtered["Week"].max())
-    else:
-        min_week, max_week = 1, 52
-    
-    fig = px.line(
-        weekly_listing,
-        x="Week",
-        y="Sales Value (£)",
-        color=color_field,
-        markers=True,
-        title="Weekly Revenue by Listing",
-        labels={"Sales Value (£)": "Revenue (£)"},
-        custom_data=["RevenueK", "UnitsSold"]
-    )
-    fig.update_traces(
-        hovertemplate="Week: %{x}<br>Revenue: %{customdata[0]:.1f}K<br>Units Sold: %{customdata[1]}"
-    )
-    fig.update_layout(
-        xaxis=dict(tickmode="linear", range=[min_week, max_week]),
-        margin=dict(t=50, b=50)
-    )
-    return fig
-
-def create_pivot_table(data, selected_years, sort_order):
-    filtered = data.copy()
-    if selected_years:
-        filtered = filtered[filtered["Year"].isin(selected_years)]
-    
-    pivot = pd.pivot_table(
-        filtered,
-        values="Sales Value (£)",
-        index="Listing",
-        columns="Week",
-        aggfunc="sum",
-        fill_value=0
-    )
+    pivot = pd.pivot_table(filtered, values="Sales Value (£)", index=grouping_key,
+                           columns="Week", aggfunc="sum", fill_value=0)
     pivot["Total Revenue"] = pivot.sum(axis=1)
     pivot = pivot.round(0)
-    
-    if sort_order == "Highest to Lowest":
-        pivot = pivot.sort_values(by="Total Revenue", ascending=False)
-    else:
-        pivot = pivot.sort_values(by="Total Revenue", ascending=True)
+    new_columns = {}
+    for col in pivot.columns:
+        if isinstance(col, (int, float)):
+            new_columns[col] = f"Week {int(col)}"
+    pivot = pivot.rename(columns=new_columns)
     return pivot
 
-def create_sku_line_chart(data, sku_text, selected_years, selected_quarter):
+# --- Updated SKU Line Chart to Include Units Sold in Hover ---
+def create_sku_line_chart(data, sku_text, selected_years, selected_quarters):
+    """
+    Create a Plotly line chart for a specific SKU.
+    Filters on SKU text, years, and selected quarters (if not "All Quarters").
+    Now groups the data to sum both "Sales Value (£)" and "Order Quantity"
+    so that units sold can be displayed in the hover text.
+    """
     if "Product SKU" not in data.columns:
         st.error("The dataset does not contain a 'Product SKU' column.")
         st.stop()
@@ -253,38 +229,33 @@ def create_sku_line_chart(data, sku_text, selected_years, selected_quarter):
     filtered = filtered[filtered["Product SKU"].str.contains(sku_text, case=False, na=False)]
     if selected_years:
         filtered = filtered[filtered["Year"].isin(selected_years)]
-    if selected_quarter != "All Quarters":
-        filtered = filtered[filtered["Quarter"] == selected_quarter]
+    if selected_quarters and "All Quarters" not in selected_quarters:
+        filtered = filtered[filtered["Quarter"].isin(selected_quarters)]
     
     if filtered.empty:
         st.warning("No data available for the entered SKU and filters.")
         return None
-
-    weekly_sku = (filtered.groupby(["Year", "Week"])["Sales Value (£)"]
-                  .sum().reset_index().sort_values(by=["Year", "Week"]))
+    
+    # Group by Year and Week and sum both Sales Value and Order Quantity
+    weekly_sku = filtered.groupby(["Year", "Week"]).agg({
+        "Sales Value (£)": "sum",
+        "Order Quantity": "sum"
+    }).reset_index().sort_values(by=["Year", "Week"])
+    
     weekly_sku["RevenueK"] = weekly_sku["Sales Value (£)"] / 1000
-    if selected_quarter != "All Quarters" and not filtered.empty:
+    # Set custom_data to include RevenueK and Order Quantity (units sold)
+    if selected_quarters and "All Quarters" not in selected_quarters and not filtered.empty:
         min_week, max_week = int(filtered["Week"].min()), int(filtered["Week"].max())
     else:
         min_week, max_week = 1, 52
-
-    fig = px.line(
-        weekly_sku,
-        x="Week",
-        y="Sales Value (£)",
-        color="Year",
-        markers=True,
-        title=f"Weekly Revenue Trends for SKU matching: '{sku_text}'",
-        labels={"Sales Value (£)": "Revenue (£)"},
-        custom_data=["RevenueK"]
-    )
-    fig.update_traces(
-        hovertemplate="Week: %{x}<br>Revenue: %{customdata[0]:.1f}K"
-    )
-    fig.update_layout(
-        xaxis=dict(tickmode="linear", range=[min_week, max_week]),
-        margin=dict(t=50, b=50)
-    )
+    
+    fig = px.line(weekly_sku, x="Week", y="Sales Value (£)", color="Year", markers=True,
+                  title=f"Weekly Revenue Trends for SKU matching: '{sku_text}'",
+                  labels={"Sales Value (£)": "Revenue (£)"},
+                  custom_data=["RevenueK", "Order Quantity"])
+    fig.update_traces(hovertemplate="Week: %{x}<br>Revenue: %{customdata[0]:.1f}K<br>Units Sold: %{customdata[1]}")
+    fig.update_layout(xaxis=dict(tickmode="linear", range=[min_week, max_week]),
+                      margin=dict(t=50, b=50))
     return fig
 
 def create_daily_price_chart(data, listing, selected_years, selected_quarters, selected_channels):
@@ -295,21 +266,24 @@ def create_daily_price_chart(data, listing, selected_years, selected_quarters, s
     df_listing = data[(data["Listing"] == listing) & (data["Year"].isin(selected_years))].copy()
     if selected_quarters:
         df_listing = df_listing[df_listing["Quarter"].isin(selected_quarters)]
-    if selected_channels:
+    if selected_channels and len(selected_channels) > 0:
         df_listing = df_listing[df_listing["Sales Channel"].isin(selected_channels)]
     if df_listing.empty:
         st.warning(f"No data available for {listing} for the selected filters.")
         return None
-
+    if selected_channels and len(selected_channels) > 0:
+        unique_currencies = df_listing["Original Currency"].unique()
+        display_currency = unique_currencies[0] if len(unique_currencies) > 0 else "GBP"
+    else:
+        display_currency = "GBP"
     df_listing["Date"] = pd.to_datetime(df_listing["Date"])
     grouped = df_listing.groupby([df_listing["Date"].dt.date, "Year"]).agg({
-        "Sales Value (£)": "sum",
+        "Sales Value in Transaction Currency": "sum",
         "Order Quantity": "sum"
     }).reset_index()
     grouped.rename(columns={"Date": "Date"}, inplace=True)
-    grouped["Average Price"] = grouped["Sales Value (£)"] / grouped["Order Quantity"]
+    grouped["Average Price"] = grouped["Sales Value in Transaction Currency"] / grouped["Order Quantity"]
     grouped["Date"] = pd.to_datetime(grouped["Date"])
-    
     dfs = []
     for yr in selected_years:
         df_year = grouped[grouped["Year"] == yr].copy()
@@ -320,20 +294,34 @@ def create_daily_price_chart(data, listing, selected_years, selected_quarters, s
         end_day = int(df_year["Day"].max())
         df_year = df_year.set_index("Day").reindex(range(start_day, end_day + 1))
         df_year.index.name = "Day"
-        df_year["Average Price"] = df_year["Average Price"].interpolate(method="linear")
+        df_year["Average Price"] = df_year["Average Price"].ffill()
+        prices = df_year["Average Price"].values.copy()
+        for i in range(1, len(prices)):
+            if prices[i] < 0.75 * prices[i-1]:
+                prices[i] = prices[i-1]
+            if prices[i] > 1.25 * prices[i-1]:
+                prices[i] = prices[i-1]
+        df_year["Average Price"] = prices
         df_year["Year"] = yr
         df_year = df_year.reset_index()
         dfs.append(df_year)
-    
     if not dfs:
         st.warning("No data available after processing for the selected filters.")
         return None
-
     combined = pd.concat(dfs, ignore_index=True)
-    fig = px.line(combined, x="Day", y="Average Price", color="Year",
-                  title=f"Daily Average Price for {listing}",
-                  labels={"Day": "Day of Year", "Average Price": "Average Price (£)"},
-                  color_discrete_sequence=px.colors.qualitative.Set1)
+    fig = px.line(
+        combined, 
+        x="Day", 
+        y="Average Price", 
+        color="Year",
+        title=f"Daily Average Price for {listing}",
+        labels={
+            "Day": "Day of Year", 
+            "Average Price": f"Average Price ({display_currency})"
+        },
+        color_discrete_sequence=px.colors.qualitative.Set1
+    )
+    fig.update_yaxes(rangemode="tozero")
     fig.update_layout(margin=dict(t=50, b=50))
     return fig
 
@@ -341,89 +329,84 @@ def create_daily_price_chart(data, listing, selected_years, selected_quarters, s
 # MAIN CODE
 # =============================================================================
 
-# Load and process the SAP data (mandatory)
-df = load_data(sap_file)
+df = load_data(uploaded_file)
 df = preprocess_data(df)
-
-# Load the ADs data if provided (optional)
-if ads_file is not None:
-    ads_df = load_data(ads_file)
-else:
-    ads_df = None
 
 available_years = sorted(df["Year"].dropna().unique())
 if not available_years:
     st.error("No year data available.")
     st.stop()
 current_year = available_years[-1]
-
 if len(available_years) >= 2:
     prev_year = available_years[-2]
     yoy_default_years = [prev_year, current_year]
 else:
     yoy_default_years = [current_year]
-
 default_current_year = [current_year]
 
-# Reorganize tabs in the new order:
 tabs = st.tabs([
     "KPIs", 
     "YOY Trends", 
     "Daily Prices", 
     "SKU Trends", 
-    "Sales Channel", 
     "Pivot Table", 
-    "Listings",
-    "Ad Campaign Analysis"
+    "Ad Campaign Analysis",
+    "Unrecognised Sales"
 ])
 
 # -----------------------------------------
-# Tab 1: KPIs
+# Tab 1: KPIs (Existing Code)
 # -----------------------------------------
 with tabs[0]:
-    st.header("Key Performance Indicators")
-    with st.expander("KPI Filters", expanded=True):
+    st.markdown("### Key Performance Indicators")
+    with st.expander("KPI Filters", expanded=False):
         today = datetime.date.today()
-        if today.weekday() != 6:
-            last_full_week_end = today - datetime.timedelta(days=today.weekday() + 1)
-        else:
-            last_full_week_end = today
+        last_full_week_end = today - datetime.timedelta(days=today.weekday() + 1) if today.weekday() != 6 else today
         default_week = last_full_week_end.isocalendar()[1]
         available_weeks = sorted(df["Week"].dropna().unique())
         default_index = available_weeks.index(default_week) if default_week in available_weeks else 0
-
-        selected_week = st.selectbox(
-            "Select Week for KPI Calculation",
-            options=available_weeks,
-            index=default_index,
-            key="kpi_week",
-            help="Select the week to calculate KPIs for. (Defaults to the last full week)"
-        )
+        selected_week = st.selectbox("Select Week for KPI Calculation",
+                                     options=available_weeks,
+                                     index=default_index,
+                                     key="kpi_week",
+                                     help="Select the week to calculate KPIs for. (Defaults to the last full week)")
+        monday, sunday = get_week_date_range(current_year, selected_week)
+        if monday and sunday:
+            st.info(f"Wk {selected_week}: {monday.strftime('%d %b')} - {sunday.strftime('%d %b, %Y')}")
     kpi_data = df[df["Week"] == selected_week]
     kpi_summary = kpi_data.groupby("Year")["Sales Value (£)"].sum()
     all_years = sorted(df["Year"].dropna().unique())
     kpi_summary = kpi_summary.reindex(all_years, fill_value=0)
-    pct_change = kpi_summary.pct_change() * 100
-
     kpi_cols = st.columns(len(all_years))
     for idx, year in enumerate(all_years):
         with kpi_cols[idx]:
             st.subheader(f"Year {year}")
+            st.markdown(f"<div style='font-size: 1.2em;'>Week {selected_week} Revenue</div>", unsafe_allow_html=True)
             if kpi_summary[year] == 0:
                 st.write("Revenue: N/A")
             else:
-                st.metric(
-                    label=f"Week {selected_week} Revenue",
-                    value=format_currency(kpi_summary[year]),
-                    delta=f"{pct_change[year]:.2f}%" if idx > 0 and not pd.isna(pct_change[year]) else ""
-                )
-
+                revenue_str = format_currency_int(kpi_summary[year])
+                if idx > 0:
+                    delta_val = int(round(kpi_summary[year] - kpi_summary[all_years[idx - 1]]))
+                    if delta_val > 0:
+                        delta_display = f"↑ {delta_val:,}"
+                        color = "green"
+                    elif delta_val < 0:
+                        delta_display = f"↓ -{abs(delta_val):,}"
+                        color = "red"
+                    else:
+                        delta_display = ""
+                        color = "black"
+                else:
+                    delta_display = ""
+                    color = "black"
+                st.markdown(f"<div style='font-size: 1.5em;'>{revenue_str}</div>", unsafe_allow_html=True)
+                if delta_display:
+                    st.markdown(f"<div style='font-size: 1.2em; color: {color};'>{delta_display}</div>", unsafe_allow_html=True)
     st.markdown("---")
-    st.subheader("Top Gainers and Losers for Week " + str(selected_week) + " (" + str(current_year) + ")")
-
+    st.subheader(f"Top Gainers and Losers for Week {selected_week} ({current_year})")
     current_year_data = df[df["Year"] == current_year]
     week_data_current = current_year_data[current_year_data["Week"] == selected_week]
-
     if selected_week > 1:
         previous_week = selected_week - 1
         week_data_prev = current_year_data[current_year_data["Week"] == previous_week]
@@ -434,31 +417,24 @@ with tabs[0]:
             week_data_prev = df[(df["Year"] == prev_year) & (df["Week"] == 52)]
         else:
             week_data_prev = pd.DataFrame(columns=current_year_data.columns)
-
     rev_current = week_data_current.groupby("Listing")["Sales Value (£)"].sum()
     rev_previous = week_data_prev.groupby("Listing")["Sales Value (£)"].sum()
     combined = pd.concat([rev_current, rev_previous], axis=1, keys=["Current", "Previous"]).fillna(0)
-
-    def compute_pct_change(row):
-        if row["Previous"] == 0:
-            return None
-        return ((row["Current"] - row["Previous"]) / row["Previous"]) * 100
-
-    combined["pct_change"] = combined.apply(compute_pct_change, axis=1)
+    def compute_abs_change(row):
+        return None if row["Previous"] == 0 else (row["Current"] - row["Previous"])
+    combined["abs_change"] = combined.apply(compute_abs_change, axis=1)
     num_items = 3
-    top_gainers = combined[combined["pct_change"].notnull()].sort_values("pct_change", ascending=False).head(num_items)
-    top_losers = combined[combined["pct_change"].notnull()].sort_values("pct_change", ascending=True).head(num_items)
-
-    def format_change(pct):
-        if pct is None:
+    top_gainers = combined[combined["abs_change"].notnull()].sort_values("abs_change", ascending=False).head(num_items)
+    top_losers = combined[combined["abs_change"].notnull()].sort_values("abs_change", ascending=True).head(num_items)
+    def format_abs_change(val):
+        if val is None:
             return "<span style='color:gray;'>N/A</span>"
-        if pct > 0:
-            return f"<span style='color:green;'>↑ {pct:.2f}%</span>"
-        elif pct < 0:
-            return f"<span style='color:red;'>↓ {abs(pct):.2f}%</span>"
+        if val > 0:
+            return f"<span style='color:green;'>↑ {int(round(val)):,}</span>"
+        elif val < 0:
+            return f"<span style='color:red;'>↓ {int(round(abs(val))):,}</span>"
         else:
-            return f"<span style='color:gray;'>→ {pct:.2f}%</span>"
-
+            return f"<span style='color:gray;'>→ {int(round(val)):,}</span>"
     col1, col2 = st.columns([1, 1])
     with col1:
         st.markdown("<div style='text-align:center;'><h4>Top Gainers</h4></div>", unsafe_allow_html=True)
@@ -466,606 +442,424 @@ with tabs[0]:
             st.info("No gainers data available for this week.")
         else:
             for listing, row in top_gainers.iterrows():
-                change_html = format_change(row["pct_change"])
-                st.markdown(
-                    f"""
+                change_html = format_abs_change(row["abs_change"])
+                st.markdown(f"""
                     <div style="background:#94f7bb; color:black; padding:10px; border-radius:8px; margin-bottom:8px; text-align:center;">
                         <strong>{listing}</strong><br>
-                        {change_html}<br>{format_currency(row['Current'])}
+                        {change_html}<br>{format_currency_int(row['Current'])}
                     </div>
-                    """, unsafe_allow_html=True
-                )
+                """, unsafe_allow_html=True)
     with col2:
         st.markdown("<div style='text-align:center;'><h4>Top Losers</h4></div>", unsafe_allow_html=True)
         if top_losers.empty:
             st.info("No losers data available for this week.")
         else:
             for listing, row in top_losers.iterrows():
-                change_html = format_change(row["pct_change"])
-                st.markdown(
-                    f"""
+                change_html = format_abs_change(row["abs_change"])
+                st.markdown(f"""
                     <div style="background:#fcb8b8; color:black; padding:10px; border-radius:8px; margin-bottom:8px; text-align:center;">
                         <strong>{listing}</strong><br>
-                        {change_html}<br>{format_currency(row['Current'])}
+                        {change_html}<br>{format_currency_int(row['Current'])}
                     </div>
-                    """, unsafe_allow_html=True
-                )
-
-    st.markdown("---")
-    st.subheader("Top and Bottom Performing Listings")
-    
-    current_week_data = current_year_data[current_year_data["Week"] == selected_week]
-    current_group = current_week_data.groupby("Listing").agg({
-        "Sales Value (£)": "sum",
-        "Order Quantity": "sum"
-    }).reset_index()
-    current_group["Avg Order Price"] = current_group["Sales Value (£)"] / current_group["Order Quantity"]
-    
-    if selected_week > 1:
-        previous_week_data = current_year_data[current_year_data["Week"] == (selected_week - 1)]
-    else:
-        previous_years = [year for year in available_years if year < current_year]
-        if previous_years:
-            prev_year = max(previous_years)
-            previous_week_data = df[(df["Year"] == prev_year) & (df["Week"] == 52)]
-        else:
-            previous_week_data = pd.DataFrame(columns=current_year_data.columns)
-    
-    if not previous_week_data.empty:
-        previous_group = previous_week_data.groupby("Listing").agg({
-            "Sales Value (£)": "sum",
-            "Order Quantity": "sum"
-        }).reset_index()
-        previous_group["Avg Order Price Prev"] = previous_group["Sales Value (£)"] / previous_group["Order Quantity"]
-    else:
-        previous_group = pd.DataFrame(columns=["Listing", "Sales Value (£)", "Order Quantity", "Avg Order Price Prev"])
-    
-    merged = pd.merge(current_group, previous_group[["Listing", "Avg Order Price Prev"]], on="Listing", how="left")
-    merged["Change in Avg Order Price (%)"] = ((merged["Avg Order Price"] - merged["Avg Order Price Prev"]) / merged["Avg Order Price Prev"]) * 100
-    merged["Change in Avg Order Price (%)"] = merged["Change in Avg Order Price (%)"].fillna(0)
-    
-    top_performers = merged.sort_values("Sales Value (£)", ascending=False).head(num_items)
-    bottom_performers = merged.sort_values("Sales Value (£)", ascending=True).head(num_items)
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown("<div style='text-align:center;'><h4>Top Performing Listings</h4></div>", unsafe_allow_html=True)
-        st.dataframe(top_performers[["Listing", "Sales Value (£)", "Avg Order Price", "Change in Avg Order Price (%)"]])
-    with col2:
-        st.markdown("<div style='text-align:center;'><h4>Bottom Performing Listings</h4></div>", unsafe_allow_html=True)
-        st.dataframe(bottom_performers[["Listing", "Sales Value (£)", "Avg Order Price", "Change in Avg Order Price (%)"]])
+                """, unsafe_allow_html=True)
 
 # -----------------------------------------
-# Tab 2: YOY Trends
+# Tab 2: YOY Trends (with Time Grouping fixed to "Week")
 # -----------------------------------------
 with tabs[1]:
-    st.header("YOY Weekly Revenue Trends")
-    with st.expander("Chart Filters", expanded=True):
-        yoy_years = st.multiselect(
-            "Select Year(s)",
-            options=available_years,
-            default=yoy_default_years,
-            key="yoy_years",
-            help="Default is previous and current year."
-        )
-        selected_quarters = st.multiselect(
-            "Select Quarter(s)",
-            options=["Q1", "Q2", "Q3", "Q4"],
-            default=["Q1", "Q2", "Q3", "Q4"],
-            key="yoy_quarters",
-            help="Select one or more quarters to filter by."
-        )
-        selected_channels = st.multiselect(
-            "Select Sales Channel(s)",
-            options=sorted(df["Sales Channel"].dropna().unique()),
-            default=[],
-            key="yoy_channels",
-            help="Select one or more channels to filter. If empty, data for all channels is shown."
-        )
-        selected_listings = st.multiselect(
-            "Select Listing(s)",
-            options=sorted(df["Listing"].dropna().unique()),
-            default=[],
-            key="yoy_listings",
-            help="Select one or more listings to filter. If empty, data for all listings is shown."
-        )
+    st.markdown("### YOY Weekly Revenue Trends")
+    with st.expander("Chart Filters", expanded=False):
+        yoy_years = st.multiselect("Select Year(s)", options=available_years,
+                                   default=yoy_default_years, key="yoy_years",
+                                   help="Default is previous and current year.")
+        selected_quarters = st.multiselect("Select Quarter(s)", options=["Q1", "Q2", "Q3", "Q4"],
+                                           default=["Q1", "Q2", "Q3", "Q4"], key="yoy_quarters",
+                                           help="Select one or more quarters to filter by.")
+        selected_channels = st.multiselect("Select Sales Channel(s)",
+                                           options=sorted(df["Sales Channel"].dropna().unique()),
+                                           default=[], key="yoy_channels",
+                                           help="Select one or more channels to filter. If empty, all channels are shown.")
+        selected_listings = st.multiselect("Select Listing(s)",
+                                           options=sorted(df["Listing"].dropna().unique()),
+                                           default=[], key="yoy_listings",
+                                           help="Select one or more listings to filter.")
         if selected_listings:
             product_options = sorted(df[df["Listing"].isin(selected_listings)]["Product"].dropna().unique())
         else:
             product_options = sorted(df["Product"].dropna().unique())
-        selected_products = st.multiselect(
-            "Select Product(s)",
-            options=product_options,
-            default=[],
-            key="yoy_products",
-            help="Select one or more products to filter. If empty, data for all products is shown."
-        )
-    fig_yoy = create_yoy_trends_chart(df, yoy_years, selected_quarters, selected_channels, selected_listings, selected_products)
+        selected_products = st.multiselect("Select Product(s)", options=product_options,
+                                           default=[], key="yoy_products",
+                                           help="Select one or more products to filter (affects the line chart only).")
+        # Remove the time grouping widget and set it to "Week" by default.
+        time_grouping = "Week"
+    fig_yoy = create_yoy_trends_chart(df, yoy_years, selected_quarters, selected_channels, selected_listings, selected_products, time_grouping=time_grouping)
     st.plotly_chart(fig_yoy, use_container_width=True)
-    
-    st.markdown("### Revenue Summary by Listing")
+    st.markdown("### Revenue Summary")
     st.markdown("")
-    today = datetime.date.today()
-    if today.weekday() != 6:
-        days_since_sunday = today.weekday() + 1
-        last_complete_week_end = today - datetime.timedelta(days=days_since_sunday)
+    filtered_df = df.copy()
+    if yoy_years:
+        filtered_df = filtered_df[filtered_df["Year"].isin(yoy_years)]
+    if selected_quarters:
+        filtered_df = filtered_df[filtered_df["Quarter"].isin(selected_quarters)]
+    if selected_channels:
+        filtered_df = filtered_df[filtered_df["Sales Channel"].isin(selected_channels)]
+    if selected_listings:
+        filtered_df = filtered_df[filtered_df["Listing"].isin(selected_listings)]
+    df_revenue = filtered_df.copy()
+    if df_revenue.empty:
+        st.info("No data available for the selected filters to build the revenue summary table.")
     else:
-        last_complete_week_end = today
-    last_complete_week_start = last_complete_week_end - datetime.timedelta(days=6)
-    df_revenue = df.copy()
-    df_revenue["Year"] = df_revenue["Year"].astype(int)
-    df_revenue["Week"] = df_revenue["Week"].astype(int)
-    df_revenue_current = df_revenue[df_revenue["Year"] == current_year].copy()
-    df_revenue_current["Week_Monday"] = df_revenue_current.apply(week_monday, axis=1)
-    df_revenue_current["Week_Sunday"] = df_revenue_current["Week_Monday"].apply(lambda d: d + datetime.timedelta(days=6) if d else None)
-    df_full_weeks_current = df_revenue_current[df_revenue_current["Week_Sunday"] <= last_complete_week_end].copy()
-    unique_weeks_current = (
-        df_full_weeks_current.groupby(["Year", "Week"])
-        .first()
-        .reset_index()[["Year", "Week", "Week_Sunday"]]
-    ).sort_values("Week_Sunday")
-    if unique_weeks_current.empty:
-        st.info("Not enough complete week data in the current year to build the revenue summary table.")
-    else:
-        last_complete_week_row_current = unique_weeks_current.iloc[-1]
-        last_week_tuple_current = (last_complete_week_row_current["Year"], last_complete_week_row_current["Week"])
-        last_4_weeks_current = unique_weeks_current.tail(4)
-        last_4_week_tuples_current = set(last_4_weeks_current[["Year", "Week"]].apply(tuple, axis=1))
-        rev_last_4_current = (
-            df_full_weeks_current[
-                df_full_weeks_current.apply(lambda row: (row["Year"], row["Week"]) in last_4_week_tuples_current, axis=1)
-            ]
-            .groupby("Listing")["Sales Value (£)"]
-            .sum()
-            .rename("Last 4 Weeks Revenue (Current Year)")
+        df_revenue["Year"] = df_revenue["Year"].astype(int)
+        df_revenue["Week"] = df_revenue["Week"].astype(int)
+        filtered_current_year = df_revenue["Year"].max()
+        df_revenue_current = df_revenue[df_revenue["Year"] == filtered_current_year].copy()
+        df_revenue_current["Week_Monday"] = df_revenue_current.apply(week_monday, axis=1)
+        df_revenue_current["Week_Sunday"] = df_revenue_current["Week_Monday"].apply(lambda d: d + datetime.timedelta(days=6) if d else None)
+        today = datetime.date.today()
+        last_complete_week_end = today - datetime.timedelta(days=today.weekday() + 1) if today.weekday() != 6 else today
+        df_full_weeks_current = df_revenue_current[df_revenue_current["Week_Sunday"] <= last_complete_week_end].copy()
+        unique_weeks_current = (
+            df_full_weeks_current.groupby(["Year", "Week"])
+            .first()
+            .reset_index()[["Year", "Week", "Week_Sunday"]]
+            .sort_values("Week_Sunday")
         )
-        rev_last_1_current = (
-            df_full_weeks_current[
+        if unique_weeks_current.empty:
+            st.info("Not enough complete week data in the filtered current year to build the revenue summary table.")
+        else:
+            last_complete_week_row_current = unique_weeks_current.iloc[-1]
+            last_week_tuple_current = (last_complete_week_row_current["Year"], last_complete_week_row_current["Week"])
+            last_week_number = last_week_tuple_current[1]
+            last_4_weeks_current = unique_weeks_current.tail(4)
+            last_4_week_numbers = last_4_weeks_current["Week"].tolist()
+            grouping_key = "Product" if selected_listings and len(selected_listings) == 1 else "Listing"
+            rev_last_4_current = (df_full_weeks_current[
+                df_full_weeks_current["Week"].isin(last_4_week_numbers)
+            ].groupby(grouping_key)["Sales Value (£)"]
+             .sum()
+             .rename("Last 4 Weeks Revenue (Current Year)")
+             .round(0)
+             .astype(int))
+            rev_last_1_current = (df_full_weeks_current[
                 df_full_weeks_current.apply(lambda row: (row["Year"], row["Week"]) == last_week_tuple_current, axis=1)
-            ]
-            .groupby("Listing")["Sales Value (£)"]
-            .sum()
-            .rename("Last Week Revenue (Current Year)")
-        )
-        if len(available_years) >= 2:
-            last_year = available_years[-2]
-            reference_date_last_year = datetime.date(last_year, 12, 31)
-            if reference_date_last_year.weekday() != 6:
-                days_since_sunday = reference_date_last_year.weekday() + 1
-                last_complete_week_end_last_year = reference_date_last_year - datetime.timedelta(days=days_since_sunday)
-            else:
-                last_complete_week_end_last_year = reference_date_last_year
-            last_complete_week_start_last_year = last_complete_week_end_last_year - datetime.timedelta(days=6)
-            df_revenue_last_year = df_revenue[df_revenue["Year"] == last_year].copy()
-            df_revenue_last_year["Week_Monday"] = df_revenue_last_year.apply(week_monday, axis=1)
-            df_revenue_last_year["Week_Sunday"] = df_revenue_last_year["Week_Monday"].apply(lambda d: d + datetime.timedelta(days=6) if d else None)
-            df_full_weeks_last_year = df_revenue_last_year[df_revenue_last_year["Week_Sunday"] <= last_complete_week_end_last_year].copy()
-            unique_weeks_last_year = (
-                df_full_weeks_last_year.groupby(["Year", "Week"])
-                .first()
-                .reset_index()[["Year", "Week", "Week_Sunday"]]
-            ).sort_values("Week_Sunday")
-            if unique_weeks_last_year.empty:
-                rev_last_4_last_year = pd.Series(dtype=float)
-                rev_last_1_last_year = pd.Series(dtype=float)
-            else:
-                last_complete_week_row_last_year = unique_weeks_last_year.iloc[-1]
-                last_week_tuple_last_year = (last_complete_week_row_last_year["Year"], last_complete_week_row_last_year["Week"])
-                last_4_weeks_last_year = unique_weeks_last_year.tail(4)
-                last_4_week_tuples_last_year = set(last_4_weeks_last_year[["Year", "Week"]].apply(tuple, axis=1))
-                rev_last_4_last_year = (
-                    df_full_weeks_last_year[
-                        df_full_weeks_last_year.apply(lambda row: (row["Year"], row["Week"]) in last_4_week_tuples_last_year, axis=1)
-                    ]
-                    .groupby("Listing")["Sales Value (£)"]
-                    .sum()
-                    .rename("Last 4 Weeks Revenue (Last Year)")
-                )
+            ].groupby(grouping_key)["Sales Value (£)"]
+             .sum()
+             .rename("Last Week Revenue (Current Year)")
+             .round(0)
+             .astype(int))
+            if len(filtered_df["Year"].unique()) >= 2:
+                filtered_years = sorted(filtered_df["Year"].unique())
+                last_year = filtered_years[-2]
+                df_revenue_last_year = df_revenue[df_revenue["Year"] == last_year].copy()
                 rev_last_1_last_year = (
-                    df_full_weeks_last_year[
-                        df_full_weeks_last_year.apply(lambda row: (row["Year"], row["Week"]) == last_week_tuple_last_year, axis=1)
-                    ]
-                    .groupby("Listing")["Sales Value (£)"]
+                    df_revenue_last_year[df_revenue_last_year["Week"] == last_week_number]
+                    .groupby(grouping_key)["Sales Value (£)"]
                     .sum()
                     .rename("Last Week Revenue (Last Year)")
+                    .round(0)
+                    .astype(int)
                 )
-        else:
-            rev_last_4_last_year = pd.Series(dtype=float)
-            rev_last_1_last_year = pd.Series(dtype=float)
-        all_listings_current = pd.Series(sorted(df_revenue_current["Listing"].unique()), name="Listing")
-        revenue_summary = pd.DataFrame(all_listings_current).set_index("Listing")
-        revenue_summary = revenue_summary.join(rev_last_4_current, how="left").join(rev_last_1_current, how="left")
-        revenue_summary = revenue_summary.fillna(0)
-        revenue_summary = revenue_summary.join(rev_last_4_last_year, how="left").join(rev_last_1_last_year, how="left")
-        revenue_summary = revenue_summary.fillna(0).reset_index()
-        revenue_summary = revenue_summary[["Listing", 
-                                           "Last 4 Weeks Revenue (Current Year)", "Last 4 Weeks Revenue (Last Year)",
-                                           "Last Week Revenue (Current Year)", "Last Week Revenue (Last Year)"]]
-        revenue_summary["4W % Change"] = revenue_summary.apply(
-            lambda row: ((row["Last 4 Weeks Revenue (Current Year)"] - row["Last 4 Weeks Revenue (Last Year)"]) / row["Last 4 Weeks Revenue (Last Year)"] * 100)
-                        if row["Last 4 Weeks Revenue (Last Year)"] != 0 else None,
-            axis=1
-        )
-        revenue_summary["1W % Change"] = revenue_summary.apply(
-            lambda row: ((row["Last Week Revenue (Current Year)"] - row["Last Week Revenue (Last Year)"]) / row["Last Week Revenue (Last Year)"] * 100)
-                        if row["Last Week Revenue (Last Year)"] != 0 else None,
-            axis=1
-        )
-        def toggle_sort():
-            st.session_state.sort_order = "asc" if st.session_state.sort_order == "desc" else "desc"
-        if "sort_order" not in st.session_state:
-            st.session_state.sort_order = "desc"
-        button_label = "Sort: High ↔ Low" if st.session_state.sort_order == "desc" else "Sort: Low ↔ High"
-        st.button(button_label, on_click=toggle_sort)
-        if st.session_state.sort_order == "desc":
-            revenue_summary = revenue_summary.sort_values("Last 4 Weeks Revenue (Current Year)", ascending=False)
-            sort_text = "Highest to Lowest"
-        else:
-            revenue_summary = revenue_summary.sort_values("Last 4 Weeks Revenue (Current Year)", ascending=True)
-            sort_text = "Lowest to Highest"
-        def combine_revenue_pct(row, revenue_col, pct_col):
-            revenue = row[revenue_col]
-            pct = row[pct_col]
-            revenue_str = f"£{revenue:,.0f}"
-            if pd.isna(pct) or revenue == 0:
-                return revenue_str
+                rev_last_4_last_year = (
+                    df_revenue_last_year[df_revenue_last_year["Week"].isin(last_4_week_numbers)]
+                    .groupby(grouping_key)["Sales Value (£)"]
+                    .sum()
+                    .rename("Last 4 Weeks Revenue (Last Year)")
+                    .round(0)
+                    .astype(int)
+                )
             else:
-                if pct > 0:
-                    pct_str = f"<span style='color:green;'>↑ {pct:.0f}%</span>"
-                elif pct < 0:
-                    pct_str = f"<span style='color:red;'>↓ {abs(pct):.0f}%</span>"
-                else:
-                    pct_str = f"<span style='color:gray;'>→ {pct:.0f}%</span>"
-                return f"{revenue_str}&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;({pct_str})"
-        revenue_summary["Last 4 Weeks (Current)"] = revenue_summary.apply(
-            lambda row: combine_revenue_pct(row, "Last 4 Weeks Revenue (Current Year)", "4W % Change"),
-            axis=1
-        )
-        revenue_summary["Last Week (Current)"] = revenue_summary.apply(
-            lambda row: combine_revenue_pct(row, "Last Week Revenue (Current Year)", "1W % Change"),
-            axis=1
-        )
-        revenue_summary = revenue_summary[[ 
-            "Listing",
-            "Last 4 Weeks (Current)",
-            "Last 4 Weeks Revenue (Last Year)",
-            "Last Week (Current)",
-            "Last Week Revenue (Last Year)"
-        ]]
-        st.markdown(f"**Current Year Revenue Summary Sorted: {sort_text} (by Last 4 Weeks Revenue)**")
-        st.write(
-            revenue_summary.style.format({
-                "Last 4 Weeks Revenue (Last Year)": "£{:,.0f}",
-                "Last Week Revenue (Last Year)": "£{:,.0f}"
-            }).to_html(escape=False),
-            unsafe_allow_html=True
-        )
+                rev_last_4_last_year = pd.Series(dtype=float)
+                rev_last_1_last_year = pd.Series(dtype=float)
+            all_keys_current = pd.Series(sorted(df_revenue_current[grouping_key].unique()), name=grouping_key)
+            revenue_summary = pd.DataFrame(all_keys_current).set_index(grouping_key)
+            revenue_summary = revenue_summary.join(rev_last_4_current, how="left") \
+                                             .join(rev_last_1_current, how="left") \
+                                             .join(rev_last_4_last_year, how="left") \
+                                             .join(rev_last_1_last_year, how="left")
+            revenue_summary = revenue_summary.fillna(0)
+            revenue_summary = revenue_summary.reset_index()
+            desired_order = [grouping_key,
+                             "Last 4 Weeks Revenue (Current Year)",
+                             "Last 4 Weeks Revenue (Last Year)",
+                             "Last 4 Weeks Diff",
+                             "Last Week Revenue (Current Year)",
+                             "Last Week Revenue (Last Year)",
+                             "Last Week Diff"]
+            revenue_summary["Last 4 Weeks Diff"] = revenue_summary["Last 4 Weeks Revenue (Current Year)"] - revenue_summary["Last 4 Weeks Revenue (Last Year)"]
+            revenue_summary["Last Week Diff"] = revenue_summary["Last Week Revenue (Current Year)"] - revenue_summary["Last Week Revenue (Last Year)"]
+            revenue_summary = revenue_summary[desired_order]
+            summary_row = {
+                grouping_key: "Total",
+                "Last 4 Weeks Revenue (Current Year)": revenue_summary["Last 4 Weeks Revenue (Current Year)"].sum(),
+                "Last 4 Weeks Revenue (Last Year)": revenue_summary["Last 4 Weeks Revenue (Last Year)"].sum(),
+                "Last Week Revenue (Current Year)": revenue_summary["Last Week Revenue (Current Year)"].sum(),
+                "Last Week Revenue (Last Year)": revenue_summary["Last Week Revenue (Last Year)"].sum(),
+                "Last 4 Weeks Diff": revenue_summary["Last 4 Weeks Diff"].sum(),
+                "Last Week Diff": revenue_summary["Last Week Diff"].sum()
+            }
+            total_df = pd.DataFrame([summary_row])
+            total_df = total_df[desired_order]
+            def color_diff(val):
+                try:
+                    if val < 0:
+                        return 'color: red'
+                    elif val > 0:
+                        return 'color: green'
+                    else:
+                        return ''
+                except Exception:
+                    return ''
+            styled_total = (
+                total_df.style
+                .format({
+                    "Last 4 Weeks Revenue (Current Year)": "{:,}",
+                    "Last 4 Weeks Revenue (Last Year)": "{:,}",
+                    "Last Week Revenue (Current Year)": "{:,}",
+                    "Last Week Revenue (Last Year)": "{:,}",
+                    "Last 4 Weeks Diff": "{:,.0f}",
+                    "Last Week Diff": "{:,.0f}"
+                })
+                .applymap(color_diff, subset=["Last 4 Weeks Diff", "Last Week Diff"])
+                .set_properties(**{'font-weight': 'bold'})
+            )
+            styled_main = (
+                revenue_summary.style
+                .format({
+                    "Last 4 Weeks Revenue (Current Year)": "{:,}",
+                    "Last 4 Weeks Revenue (Last Year)": "{:,}",
+                    "Last Week Revenue (Current Year)": "{:,}",
+                    "Last Week Revenue (Last Year)": "{:,}",
+                    "Last 4 Weeks Diff": "{:,.0f}",
+                    "Last Week Diff": "{:,.0f}"
+                })
+                .applymap(color_diff, subset=["Last 4 Weeks Diff", "Last Week Diff"])
+            )
+            st.markdown("##### Total Summary")
+            st.dataframe(styled_total, use_container_width=True)
+            st.markdown("##### Detailed Summary")
+            st.dataframe(styled_main, use_container_width=True)
 
 # -----------------------------------------
 # Tab 3: Daily Prices
 # -----------------------------------------
 with tabs[2]:
-    st.header("Daily Prices for Top Listings")
-    with st.expander("Daily Price Filters", expanded=True):
+    st.markdown("### Daily Prices for Top Listings")
+    with st.expander("Daily Price Filters", expanded=False):
         default_daily_years = [year for year in available_years if year in (2024, 2025)]
         if not default_daily_years:
             default_daily_years = [current_year]
-        selected_daily_years = st.multiselect(
-            "Select Year(s) to compare",
-            options=available_years,
-            default=default_daily_years,
-            key="daily_years",
-            help="Default shows 2024 and 2025 if available."
-        )
-        selected_daily_quarters = st.multiselect(
-            "Select Quarter(s)",
-            options=["Q1", "Q2", "Q3", "Q4"],
-            default=["Q1", "Q2", "Q3", "Q4"],
-            key="daily_quarters",
-            help="Select one or more quarters to filter."
-        )
-        selected_daily_channels = st.multiselect(
-            "Select Sales Channel(s)",
-            options=sorted(df["Sales Channel"].dropna().unique()),
-            default=[],
-            key="daily_channels",
-            help="Select one or more sales channels to filter the daily price data."
-        )
-    
+        selected_daily_years = st.multiselect("Select Year(s) to compare", options=available_years,
+                                              default=default_daily_years, key="daily_years",
+                                              help="Default shows 2024 and 2025 if available.")
+        selected_daily_quarters = st.multiselect("Select Quarter(s)", options=["Q1", "Q2", "Q3", "Q4"],
+                                                 default=["Q1", "Q2", "Q3", "Q4"], key="daily_quarters",
+                                                 help="Select one or more quarters to filter.")
+        selected_daily_channels = st.multiselect("Select Sales Channel(s)",
+                                                 options=sorted(df["Sales Channel"].dropna().unique()),
+                                                 default=[], key="daily_channels",
+                                                 help="Select one or more sales channels to filter the daily price data.")
     main_listings = ["Pattern Pants", "Pattern Shorts", "Solid Pants", "Solid Shorts", "Patterned Polos"]
     for listing in main_listings:
         st.subheader(listing)
-        fig_daily = create_daily_price_chart(
-            df, listing, selected_daily_years, selected_daily_quarters, selected_daily_channels
-        )
+        fig_daily = create_daily_price_chart(df, listing, selected_daily_years, selected_daily_quarters, selected_daily_channels)
         if fig_daily:
             st.plotly_chart(fig_daily, use_container_width=True)
-    
-    st.markdown("## Daily Prices Comparison")
-    with st.expander("Comparison Chart Filters", expanded=True):
-        comp_years = st.multiselect(
-            "Select Year(s)",
-            options=available_years,
-            default=default_daily_years,
-            key="comp_years",
-            help="Select the year(s) for the comparison chart."
-        )
-        comp_channels = st.multiselect(
-            "Select Sales Channel(s)",
-            options=sorted(df["Sales Channel"].dropna().unique()),
-            default=[],
-            key="comp_channels",
-            help="Select the sales channel(s) for the comparison chart."
-        )
-        comp_listing = st.selectbox(
-            "Select Listing",
-            options=sorted(df["Listing"].dropna().unique()),
-            key="comp_listing",
-            help="Select a listing for daily prices comparison."
-        )
-    
+    st.markdown("### Daily Prices Comparison")
+    with st.expander("Comparison Chart Filters", expanded=False):
+        comp_years = st.multiselect("Select Year(s)", options=available_years,
+                                    default=default_daily_years, key="comp_years",
+                                    help="Select the year(s) for the comparison chart.")
+        comp_channels = st.multiselect("Select Sales Channel(s)",
+                                       options=sorted(df["Sales Channel"].dropna().unique()),
+                                       default=[], key="comp_channels",
+                                       help="Select the sales channel(s) for the comparison chart.")
+        comp_listing = st.selectbox("Select Listing", options=sorted(df["Listing"].dropna().unique()),
+                                    key="comp_listing",
+                                    help="Select a listing for daily prices comparison.")
     all_quarters = ["Q1", "Q2", "Q3", "Q4"]
-    fig_comp = create_daily_price_chart(
-        df, comp_listing, comp_years, all_quarters, comp_channels
-    )
+    fig_comp = create_daily_price_chart(df, comp_listing, comp_years, all_quarters, comp_channels)
     if fig_comp:
         st.plotly_chart(fig_comp, use_container_width=True)
 
 # -----------------------------------------
-# Tab 4: SKU Trends
+# Tab 4: SKU Trends (with Multiple Quarter Selection)
 # -----------------------------------------
 with tabs[3]:
-    st.header("SKU Trends")
+    st.markdown("### SKU Trends")
     if "Product SKU" not in df.columns:
         st.error("The dataset does not contain a 'Product SKU' column.")
     else:
         with st.expander("SKU Chart Filters", expanded=True):
-            sku_text = st.text_input(
-                "Enter Product SKU",
-                value="",
-                key="sku_input",
-                help="Enter a SKU (or part of it) to display its weekly revenue trends."
-            )
-            sku_years = st.multiselect(
-                "Select Year(s)",
-                options=available_years,
-                default=default_current_year,
-                key="sku_years",
-                help="Default is the current year."
-            )
-            sku_quarter = st.selectbox(
-                "Select Quarter",
-                options=["All Quarters", "Q1", "Q2", "Q3", "Q4"],
-                index=0,
-                key="sku_quarter",
-                help="Select a specific quarter or All Quarters."
-            )
+            sku_text = st.text_input("Enter Product SKU", value="",
+                                     key="sku_input",
+                                     help="Enter a SKU (or part of it) to display its weekly revenue trends.")
+            sku_years = st.multiselect("Select Year(s)", options=available_years,
+                                       default=default_current_year, key="sku_years",
+                                       help="Default is the current year.")
+            sku_quarters = st.multiselect("Select Quarter(s)", 
+                                          options=["All Quarters", "Q1", "Q2", "Q3", "Q4"],
+                                          default=["All Quarters"],
+                                          key="sku_quarters",
+                                          help="Select one or more quarters for SKU trends. 'All Quarters' means no quarter filtering.")
         if sku_text.strip() == "":
             st.info("Please enter a Product SKU to view its trends.")
         else:
-            fig_sku = create_sku_line_chart(df, sku_text, sku_years, sku_quarter)
+            fig_sku = create_sku_line_chart(df, sku_text, sku_years, sku_quarters)
             if fig_sku is not None:
                 st.plotly_chart(fig_sku, use_container_width=True)
+            
+            # --- SKU Breakdown Pivot Table with Total Units Sold Summary ---
+            filtered_sku_data = df[df["Product SKU"].str.contains(sku_text, case=False, na=False)]
+            if sku_years:
+                filtered_sku_data = filtered_sku_data[filtered_sku_data["Year"].isin(sku_years)]
+            if sku_quarters and "All Quarters" not in sku_quarters:
+                filtered_sku_data = filtered_sku_data[filtered_sku_data["Quarter"].isin(sku_quarters)]
+            
+            if "Order Quantity" in filtered_sku_data.columns:
+                # Total Units Sold Summary table
+                total_units = (
+                    filtered_sku_data.groupby("Year")["Order Quantity"]
+                    .sum()
+                    .reset_index()
+                )
+                # Pivot so that each column is a year and the row displays the total units sold
+                total_units_summary = total_units.set_index("Year").T
+                total_units_summary.index = ["Total Units Sold"]
+                st.markdown("##### Total Units Sold Summary")
+                st.dataframe(total_units_summary, use_container_width=True)
+                
+                # SKU Breakdown pivot table by SKU and Year
+                sku_units = (
+                    filtered_sku_data.groupby(["Product SKU", "Year"])["Order Quantity"]
+                    .sum()
+                    .reset_index()
+                )
+                sku_pivot = sku_units.pivot(index="Product SKU", columns="Year", values="Order Quantity")
+                sku_pivot = sku_pivot.fillna(0).astype(int)
+                st.markdown("##### SKU Breakdown (Units Sold by Year)")
+                st.dataframe(sku_pivot, use_container_width=True)
+            else:
+                st.info("No 'Order Quantity' data available to show units sold.")
 
 # -----------------------------------------
-# Tab 5: Sales Channel
+# Tab 5: Pivot Table
 # -----------------------------------------
 with tabs[4]:
-    st.header("Sales Revenue by Sales Channel")
-    with st.expander("Chart Filters", expanded=True):
-        st.write("Select the Year(s) to include:")
-        selected_sc_years = []
-        for year in available_years:
-            if st.checkbox(f"{year}", key=f"sc_year_{year}"):
-                selected_sc_years.append(year)
-        if not selected_sc_years:
-            selected_sc_years = default_current_year
-        sc_quarter = st.selectbox(
-            "Select Quarter",
-            options=["All Quarters", "Q1", "Q2", "Q3", "Q4"],
-            index=0,
-            key="sc_quarter",
-            help="Select a specific quarter or All Quarters."
-        )
-    fig_sc = create_sales_channel_chart(df, selected_sc_years, sc_quarter)
-    st.plotly_chart(fig_sc, use_container_width=True)
-
-# -----------------------------------------
-# Tab 6: Pivot Table
-# -----------------------------------------
-with tabs[5]:
-    st.header("Pivot Table: Revenue by Listing & Week")
-    with st.expander("Pivot Table Filters", expanded=True):
-        pivot_years = st.multiselect(
-            "Select Year(s) for Pivot Table",
-            options=available_years,
-            default=default_current_year,
-            key="pivot_years",
-            help="Default is the current year."
-        )
-        sort_order = st.radio(
-            "Sort by Total Revenue:",
-            options=["Highest to Lowest", "Lowest to Highest"],
-            index=0,
-            horizontal=True,
-            key="pivot_sort_order"
-        )
-    pivot = create_pivot_table(df, pivot_years, sort_order)
+    st.markdown("### Pivot Table: Revenue by Week")
+    with st.expander("Pivot Table Filters", expanded=False):
+        pivot_years = st.multiselect("Select Year(s) for Pivot Table", options=available_years,
+                                     default=default_current_year, key="pivot_years",
+                                     help="Default is the current year.")
+        pivot_quarters = st.multiselect("Select Quarter(s)", options=["Q1", "Q2", "Q3", "Q4"],
+                                        default=["Q1", "Q2", "Q3", "Q4"], key="pivot_quarters",
+                                        help="Select one or more quarters to filter by.")
+        pivot_channels = st.multiselect("Select Sales Channel(s)",
+                                        options=sorted(df["Sales Channel"].dropna().unique()),
+                                        default=[], key="pivot_channels",
+                                        help="Select one or more channels to filter. If empty, all channels are shown.")
+        pivot_listings = st.multiselect("Select Listing(s)",
+                                        options=sorted(df["Listing"].dropna().unique()),
+                                        default=[], key="pivot_listings",
+                                        help="Select one or more listings to filter. If empty, all listings are shown.")
+        if pivot_listings and len(pivot_listings) == 1:
+            pivot_product_options = sorted(df[df["Listing"] == pivot_listings[0]]["Product"].dropna().unique())
+        else:
+            pivot_product_options = sorted(df["Product"].dropna().unique())
+        pivot_products = st.multiselect("Select Product(s)",
+                                        options=pivot_product_options,
+                                        default=[], key="pivot_products",
+                                        help="Select one or more products to filter (only applies if a specific listing is selected).")
+    grouping_key = "Product" if (pivot_listings and len(pivot_listings) == 1) else "Listing"
+    effective_products = pivot_products if grouping_key == "Product" else []
+    pivot = create_pivot_table(df,
+                               selected_years=pivot_years,
+                               selected_quarters=pivot_quarters,
+                               selected_channels=pivot_channels,
+                               selected_listings=pivot_listings,
+                               selected_products=effective_products,
+                               grouping_key=grouping_key)
+    if len(pivot_years) == 1:
+        year_for_date = int(pivot_years[0])
+        new_columns = []
+        for col in pivot.columns:
+            if col == "Total Revenue":
+                new_columns.append((col, "Total Revenue"))
+            else:
+                try:
+                    week_number = int(col.split()[1])
+                    mon, sun = get_week_date_range(year_for_date, week_number)
+                    date_range = f"{mon.strftime('%d %b')} - {sun.strftime('%d %b')}" if mon and sun else ""
+                    new_columns.append((col, date_range))
+                except Exception:
+                    new_columns.append((col, ""))
+        pivot.columns = pd.MultiIndex.from_tuples(new_columns)
     st.dataframe(pivot, use_container_width=True)
 
 # -----------------------------------------
-# Tab 7: Listings
+# Tab 6: Ad Campaign Analysis
+# -----------------------------------------
+with tabs[5]:
+    st.markdown("### Ad Campaign Analysis")
+    if advertising_file is None:
+        st.info("Please upload an advertising dataset to view the analysis in this tab.")
+    else:
+        ad_data = load_ad_data(advertising_file)
+        st.markdown("## Campaign Comparison")
+        with st.expander("Compare Monthly Metrics", expanded=False):
+            if "Start Date" in ad_data.columns:
+                ad_data["Start Date"] = pd.to_datetime(ad_data["Start Date"], errors='coerce')
+                ad_data["Month"] = ad_data["Start Date"].dt.strftime("%B")
+                ad_data["Year"] = ad_data["Start Date"].dt.year
+                available_months = sorted(ad_data["Month"].dropna().unique(), key=lambda m: list(calendar.month_name).index(m))
+                available_years_ad = sorted(ad_data["Year"].dropna().unique())
+            else:
+                available_months = list(calendar.month_name)[1:]
+                available_years_ad = []
+            selected_month = st.selectbox("Select Month", options=available_months, index=0)
+            selected_ad_years = st.multiselect("Select Year(s)", options=available_years_ad, default=available_years_ad)
+            available_listings_ad = sorted(ad_data["Portfolio name"].dropna().unique())
+            selected_listing = st.selectbox("Select Listing", options=available_listings_ad, index=0)
+            filtered = ad_data[(ad_data["Month"] == selected_month) &
+                               (ad_data["Year"].isin(selected_ad_years)) &
+                               (ad_data["Portfolio name"] == selected_listing)]
+            if filtered.empty:
+                st.warning("No advertising data available for the selected month, years, and listing filter.")
+            else:
+                agg = filtered.groupby(["Campaign Name", "Year"]).agg({
+                    "7 Day Total Sales": "sum",
+                    "Spend": "sum"
+                }).reset_index()
+                agg.rename(columns={"7 Day Total Sales": "Revenue"}, inplace=True)
+                agg["ACOS"] = agg.apply(lambda row: (row["Spend"] / row["Revenue"] * 100) if row["Revenue"] > 0 else 0, axis=1)
+                category_orders = {"Year": sorted(filtered["Year"].unique())}
+                rev_fig = px.bar(agg, x="Campaign Name", y="Revenue", color="Year",
+                                 barmode="group", category_orders=category_orders,
+                                 title=f"Revenue for {selected_month} - {selected_listing}",
+                                 labels={"Revenue": "Revenue (£)", "Campaign Name": "Campaign"})
+                spend_fig = px.bar(agg, x="Campaign Name", y="Spend", color="Year",
+                                   barmode="group", category_orders=category_orders,
+                                   title=f"Spend for {selected_month} - {selected_listing}",
+                                   labels={"Spend": "Spend (£)", "Campaign Name": "Campaign"})
+                acos_fig = px.bar(agg, x="Campaign Name", y="ACOS", color="Year",
+                                  barmode="group", category_orders=category_orders,
+                                  title=f"ACOS (%) for {selected_month} - {selected_listing}",
+                                  labels={"ACOS": "ACOS (%)", "Campaign Name": "Campaign"})
+                st.plotly_chart(rev_fig, use_container_width=True)
+                st.plotly_chart(spend_fig, use_container_width=True)
+                st.plotly_chart(acos_fig, use_container_width=True)
+                st.markdown("### Available Campaigns for Selected Listing")
+                display_cols = ["Campaign Name", "Portfolio name", "Program Type", "Status", "Spend", "7 Day Total Sales", "Total Advertising Cost of Sales (ACOS)"]
+                st.dataframe(filtered[display_cols])
+                
+# -----------------------------------------
+# Tab 7: Unrecognised Sales
 # -----------------------------------------
 with tabs[6]:
-    st.header("Weekly Sales by Listing")
-    with st.expander("Chart Filters", expanded=True):
-        listings_years = st.multiselect(
-            "Select Year(s)",
-            options=available_years,
-            default=default_current_year,
-            key="listings_years",
-            help="Default is the current year."
-        )
-        listings_quarters = st.multiselect(
-            "Select Quarter(s)",
-            options=["All Quarters", "Q1", "Q2", "Q3", "Q4"],
-            default=["All Quarters"],
-            key="listings_quarters",
-            help="Select one or more quarters. Choose 'All Quarters' to include every quarter."
-        )
-        available_listings = sorted(df["Listing"].dropna().unique())
-        default_listings = ["Pattern Pants", "Pattern Shorts", "Solid Pants", "Solid Shorts", "Pattern Polo"]
-        selected_listings = st.multiselect(
-            "Select Listing(s)",
-            options=available_listings,
-            default=[lst for lst in default_listings if lst in available_listings],
-            key="selected_listings",
-            help="Select one or more listings to display."
-        )
-    if not selected_listings:
-        st.info("Please select one or more listings to display the graph.")
+    st.markdown("### Unrecognised Sales")
+    unrecognised_sales = df[df["Listing"].str.contains("unrecognised", case=False, na=False)]
+    columns_to_drop = ["Year", "Weekly Sales Value (£)", "YOY Growth (%)"]
+    unrecognised_sales = unrecognised_sales.drop(columns=columns_to_drop, errors='ignore')
+    if unrecognised_sales.empty:
+        st.info("No unrecognised sales found.")
     else:
-        fig_listing = create_listings_chart(df, listings_years, listings_quarters, selected_listings)
-        st.plotly_chart(fig_listing, use_container_width=True)
-
-# -----------------------------------------
-# Tab 8: Ad Campaign Analysis
-# -----------------------------------------
-with tabs[7]:
-    st.header("Ad Campaign Analysis")
-    if ads_df is None:
-        st.info("No ADs data uploaded. Please use the ADs Data Uploader in the sidebar to see campaign analysis.")
-    else:
-        st.write("Below are comparison charts for ADs revenue and ACOS for 2024 vs 2025 campaigns.")
-        with st.expander("AD Campaign Filters", expanded=True):
-            # Let the user select one or both periods
-            periods = st.multiselect("Select Campaign Periods", options=["Jan 24", "Jan 25"], default=["Jan 24", "Jan 25"])
-            # Dropdown for listing filter with an "All Listings" option
-            unique_listings = sorted(ads_df["Listing"].unique())
-            listing_options = ["All Listings"] + unique_listings
-            selected_listing = st.selectbox("Select Listing", options=listing_options)
-        
-        # Reshape ADs data into long format for the selected periods.
-        df_list = []
-        for period in periods:
-            rev_col = f"{period} Rev"
-            acos_col = f"{period} ACOS (%)"
-            if rev_col in ads_df.columns and acos_col in ads_df.columns:
-                # Include the Campaign column so we can compare individual campaigns
-                temp = ads_df[["Listing", "Campaign", rev_col, acos_col]].copy()
-                # Multiply the ACOS values by 100, round to 0 decimals, and convert to integer (e.g. 0.1455 becomes 15)
-                temp[acos_col] = (temp[acos_col] * 100).round(0).astype(int)
-                temp["Period"] = period
-                temp = temp.rename(columns={rev_col: "Revenue", acos_col: "ACOS"})
-                df_list.append(temp)
-            else:
-                st.error(f"ADs data is missing columns for period {period}")
-        if df_list:
-            ads_long = pd.concat(df_list)
-        else:
-            st.error("No valid periods selected.")
-            ads_long = pd.DataFrame()
-        
-        # Filter out campaigns (or listings) that have zero total revenue.
-        if selected_listing != "All Listings":
-            filtered_ads = ads_long[ads_long["Listing"] == selected_listing]
-            # Group by Campaign and Period so that each campaign’s data is displayed.
-            campaign_summary = filtered_ads.groupby(["Campaign", "Period"]).agg({
-                "Revenue": "sum", "ACOS": "mean"
-            }).reset_index()
-            # Remove campaigns with zero total revenue across all periods
-            campaign_totals = campaign_summary.groupby("Campaign")["Revenue"].sum().reset_index()
-            non_zero_campaigns = campaign_totals[campaign_totals["Revenue"] != 0]["Campaign"].unique()
-            campaign_summary = campaign_summary[campaign_summary["Campaign"].isin(non_zero_campaigns)]
-            # Round the aggregated ACOS values to 0 decimals and convert to int
-            campaign_summary["ACOS"] = campaign_summary["ACOS"].round(0).astype(int)
-            fig_ads_revenue = px.bar(
-                campaign_summary,
-                x="Campaign",
-                y="Revenue",
-                color="Period",
-                barmode="group",
-                title=f"ADs Revenue by Campaign for {selected_listing}",
-                labels={"Revenue": "Revenue (£)"}
-            )
-            fig_ads_acos = px.bar(
-                campaign_summary,
-                x="Campaign",
-                y="ACOS",
-                color="Period",
-                barmode="group",
-                title=f"ADs ACOS by Campaign for {selected_listing}",
-                labels={"ACOS": "ACOS (%)"}
-            )
-        else:
-            # For all listings, group by Listing and Period.
-            listing_summary = ads_long.groupby(["Listing", "Period"]).agg({
-                "Revenue": "sum", "ACOS": "mean"
-            }).reset_index()
-            # Remove listings with zero total revenue
-            listing_totals = listing_summary.groupby("Listing")["Revenue"].sum().reset_index()
-            non_zero_listings = listing_totals[listing_totals["Revenue"] != 0]["Listing"].unique()
-            listing_summary = listing_summary[listing_summary["Listing"].isin(non_zero_listings)]
-            listing_summary["ACOS"] = listing_summary["ACOS"].round(0).astype(int)
-            fig_ads_revenue = px.bar(
-                listing_summary,
-                x="Listing",
-                y="Revenue",
-                color="Period",
-                barmode="group",
-                title="ADs Revenue by Listing",
-                labels={"Revenue": "Revenue (£)"}
-            )
-            fig_ads_acos = px.bar(
-                listing_summary,
-                x="Listing",
-                y="ACOS",
-                color="Period",
-                barmode="group",
-                title="ADs ACOS by Listing",
-                labels={"ACOS": "ACOS (%)"}
-            )
-        st.plotly_chart(fig_ads_revenue, use_container_width=True)
-        st.plotly_chart(fig_ads_acos, use_container_width=True)
-        st.markdown("---")
-        st.subheader("Full ADs Data")
-        
-        # Define the formatting function for ACOS values
-        def format_acos(x):
-            try:
-                return f"{int(round(x * 100))}%"
-            except Exception:
-                return x
-        
-        # Define the formatting function for revenue values (no decimals)
-        def format_revenue(x):
-            try:
-                return f"£{float(x):,.0f}"
-            except Exception:
-                return x
-        
-        # Identify ACOS columns (assumes they contain "ACOS" in the column name)
-        acos_columns = [col for col in ads_df.columns if "ACOS" in col]
-        # Identify Revenue columns (assumes they contain "Rev" in the column name)
-        revenue_columns = [col for col in ads_df.columns if "Rev" in col]
-        
-        # Create a formatting dictionary for these columns
-        format_dict = {}
-        for col in acos_columns:
-            format_dict[col] = format_acos
-        for col in revenue_columns:
-            format_dict[col] = format_revenue
-        
-        # Filter the full ADs data table to match the selected listing, if applicable,
-        # and remove rows where all revenue columns are zero.
-        if selected_listing != "All Listings":
-            ads_table = ads_df[ads_df["Listing"] == selected_listing]
-        else:
-            ads_table = ads_df.copy()
-        if revenue_columns:
-            ads_table = ads_table[(ads_table[revenue_columns] != 0).any(axis=1)]
-        
-        st.dataframe(
-            ads_table.style.format(format_dict),
-            use_container_width=True
-        )
+        st.dataframe(unrecognised_sales, use_container_width=True)
