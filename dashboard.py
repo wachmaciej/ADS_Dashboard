@@ -14,18 +14,6 @@ warnings.filterwarnings("ignore")
 # --- Page Configuration ---
 st.set_page_config(page_title="YOY Dashboard", page_icon=":chart_with_upwards_trend:", layout="wide")
 
-# --- Custom CSS (Optional) ---
-st.markdown(
-    """
-    <style>
-    .main {background-color: #f8f9fa;}
-    .sidebar .sidebar-content {background-color: #343a40; color: white;}
-    /* Reduce gap between columns */
-    .css-1lcbmhc.e1tzin5v3 { gap: 0.5rem !important; }
-    </style>
-    """,
-    unsafe_allow_html=True
-)
 
 # --- Title and Logo ---
 col1, col2 = st.columns([3, 1])
