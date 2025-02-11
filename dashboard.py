@@ -14,7 +14,6 @@ warnings.filterwarnings("ignore")
 # --- Page Configuration ---
 st.set_page_config(page_title="YOY Dashboard", page_icon=":chart_with_upwards_trend:", layout="wide")
 
-
 # --- Title and Logo ---
 col1, col2 = st.columns([3, 1])
 with col1:
@@ -123,7 +122,7 @@ def get_week_date_range(year, week):
     except Exception:
         return None, None
 
-# --- Updated YOY Trends Chart with x-axis left margin adjustment ---
+# --- YOY Trends Chart ---
 def create_yoy_trends_chart(data, selected_years, selected_quarters,
                             selected_channels=None, selected_listings=None,
                             selected_products=None, time_grouping="Week"):
@@ -166,9 +165,7 @@ def create_yoy_trends_chart(data, selected_years, selected_quarters,
                   custom_data=["RevenueK"])
     fig.update_traces(hovertemplate=f"{x_axis_label}: %{{x}}<br>Revenue: %{{customdata[0]:.1f}}K")
     
-    # When grouping by week, adjust the x-axis range so that the first data point has a slight left margin.
     if time_grouping == "Week":
-        # Instead of starting exactly at 1, start at 0.8 to add a little padding.
         min_week = 0.8  
         max_week = grouped["Week"].max() if not grouped["Week"].empty else 52
         fig.update_xaxes(range=[min_week, max_week])
@@ -201,12 +198,12 @@ def create_pivot_table(data, selected_years, selected_quarters, selected_channel
     pivot = pivot.rename(columns=new_columns)
     return pivot
 
-# --- Updated SKU Line Chart to Include Units Sold in Hover ---
-def create_sku_line_chart(data, sku_text, selected_years, selected_quarters):
+# --- SKU Line Chart (with Sales Channel Filter) ---
+def create_sku_line_chart(data, sku_text, selected_years, selected_quarters, selected_channels=None):
     """
     Create a Plotly line chart for a specific SKU.
-    Filters on SKU text, years, and selected quarters (if not "All Quarters").
-    Now groups the data to sum both "Sales Value (£)" and "Order Quantity"
+    Filters on SKU text, years, selected quarters (if not "All Quarters") and sales channels.
+    Groups the data by Year and Week, summing both "Sales Value (£)" and "Order Quantity"
     so that units sold can be displayed in the hover text.
     """
     if "Product SKU" not in data.columns:
@@ -220,18 +217,20 @@ def create_sku_line_chart(data, sku_text, selected_years, selected_quarters):
     if selected_quarters and "All Quarters" not in selected_quarters:
         filtered = filtered[filtered["Quarter"].isin(selected_quarters)]
     
+    # NEW: Filter by Sales Channel if any channels are selected
+    if selected_channels and len(selected_channels) > 0:
+        filtered = filtered[filtered["Sales Channel"].isin(selected_channels)]
+    
     if filtered.empty:
         st.warning("No data available for the entered SKU and filters.")
         return None
     
-    # Group by Year and Week and sum both Sales Value and Order Quantity
     weekly_sku = filtered.groupby(["Year", "Week"]).agg({
         "Sales Value (£)": "sum",
         "Order Quantity": "sum"
     }).reset_index().sort_values(by=["Year", "Week"])
     
     weekly_sku["RevenueK"] = weekly_sku["Sales Value (£)"] / 1000
-    # Set custom_data to include RevenueK and Order Quantity (units sold)
     if selected_quarters and "All Quarters" not in selected_quarters and not filtered.empty:
         min_week, max_week = int(filtered["Week"].min()), int(filtered["Week"].max())
     else:
@@ -343,7 +342,7 @@ tabs = st.tabs([
 ])
 
 # -----------------------------------------
-# Tab 1: KPIs (Existing Code)
+# Tab 1: KPIs
 # -----------------------------------------
 with tabs[0]:
     st.markdown("### Key Performance Indicators")
@@ -452,7 +451,7 @@ with tabs[0]:
                 """, unsafe_allow_html=True)
 
 # -----------------------------------------
-# Tab 2: YOY Trends (with Time Grouping fixed to "Week")
+# Tab 2: YOY Trends
 # -----------------------------------------
 with tabs[1]:
     st.markdown("### YOY Weekly Revenue Trends")
@@ -478,7 +477,6 @@ with tabs[1]:
         selected_products = st.multiselect("Select Product(s)", options=product_options,
                                            default=[], key="yoy_products",
                                            help="Select one or more products to filter (affects the line chart only).")
-        # Remove the time grouping widget and set it to "Week" by default.
         time_grouping = "Week"
     fig_yoy = create_yoy_trends_chart(df, yoy_years, selected_quarters, selected_channels, selected_listings, selected_products, time_grouping=time_grouping)
     st.plotly_chart(fig_yoy, use_container_width=True)
@@ -670,7 +668,7 @@ with tabs[2]:
         st.plotly_chart(fig_comp, use_container_width=True)
 
 # -----------------------------------------
-# Tab 4: SKU Trends (with Multiple Quarter Selection)
+# Tab 4: SKU Trends (with Sales Channel Filter)
 # -----------------------------------------
 with tabs[3]:
     st.markdown("### SKU Trends")
@@ -689,10 +687,16 @@ with tabs[3]:
                                           default=["All Quarters"],
                                           key="sku_quarters",
                                           help="Select one or more quarters for SKU trends. 'All Quarters' means no quarter filtering.")
+            # NEW: Sales Channel filter for SKU Trends
+            sku_channels = st.multiselect("Select Sales Channel(s)",
+                                          options=sorted(df["Sales Channel"].dropna().unique()),
+                                          default=[], key="sku_channels",
+                                          help="Select one or more sales channels to filter SKU trends. If empty, all channels are shown.")
         if sku_text.strip() == "":
             st.info("Please enter a Product SKU to view its trends.")
         else:
-            fig_sku = create_sku_line_chart(df, sku_text, sku_years, sku_quarters)
+            # Pass the selected sales channels to the chart function
+            fig_sku = create_sku_line_chart(df, sku_text, sku_years, sku_quarters, selected_channels=sku_channels)
             if fig_sku is not None:
                 st.plotly_chart(fig_sku, use_container_width=True)
             
@@ -702,6 +706,9 @@ with tabs[3]:
                 filtered_sku_data = filtered_sku_data[filtered_sku_data["Year"].isin(sku_years)]
             if sku_quarters and "All Quarters" not in sku_quarters:
                 filtered_sku_data = filtered_sku_data[filtered_sku_data["Quarter"].isin(sku_quarters)]
+            # NEW: Apply Sales Channel filter for the pivot table as well
+            if sku_channels and len(sku_channels) > 0:
+                filtered_sku_data = filtered_sku_data[filtered_sku_data["Sales Channel"].isin(sku_channels)]
             
             if "Order Quantity" in filtered_sku_data.columns:
                 # Total Units Sold Summary table
