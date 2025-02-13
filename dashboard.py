@@ -170,6 +170,9 @@ def create_yoy_trends_chart(data, selected_years, selected_quarters,
         max_week = grouped["Week"].max() if not grouped["Week"].empty else 52
         fig.update_xaxes(range=[min_week, max_week])
     
+    # Force y-axis to start at 0 regardless of Sales Channel selection
+    fig.update_yaxes(rangemode="tozero")
+    
     fig.update_layout(margin=dict(t=50, b=50))
     return fig
 
