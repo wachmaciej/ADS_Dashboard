@@ -23,7 +23,7 @@ with col2:
 
 # --- Sidebar Uploaders ---
 uploaded_file = st.sidebar.file_uploader("Upload Main Dataset (CSV or Excel)", type=["csv", "xlsx"])
-advertising_file = st.sidebar.file_uploader("Upload Advertising Data (CSV or Excel)", type=["csv", "xlsx"])
+# Removed Advertising Data uploader since it's not needed
 
 if uploaded_file is None:
     st.info("Please use the file uploader in the sidebar to upload your main dataset and view the dashboard.")
@@ -40,38 +40,6 @@ def load_data(file):
         data = pd.read_csv(file)
     else:
         data = pd.read_excel(file)
-    return data
-
-@st.cache_data(show_spinner=False)
-def load_ad_data(file):
-    """Load advertising data from CSV or Excel file and preprocess it."""
-    if file.name.endswith(".csv"):
-        data = pd.read_csv(file)
-    else:
-        data = pd.read_excel(file)
-    
-    data.columns = data.columns.str.strip()
-    for col in ["Start Date", "End Date"]:
-        if col in data.columns:
-            data[col] = pd.to_datetime(data[col], errors='coerce')
-    currency_columns = ["Budget Amount", "Spend", "Last Year Spend", "7 Day Total Sales"]
-    for col in currency_columns:
-        if col in data.columns:
-            data[col] = (data[col]
-                         .astype(str)
-                         .str.replace(r'[\$,]', '', regex=True)
-                         .str.strip()
-                         .replace('', '0')
-                         .astype(float))
-    if "Total Advertising Cost of Sales (ACOS)" in data.columns:
-        data["Total Advertising Cost of Sales (ACOS)"] = (
-            data["Total Advertising Cost of Sales (ACOS)"]
-            .astype(str)
-            .str.replace('%', '', regex=False)
-            .str.strip()
-            .replace('', '0')
-            .astype(float)
-        )
     return data
 
 def get_quarter(week):
@@ -334,13 +302,13 @@ else:
     yoy_default_years = [current_year]
 default_current_year = [current_year]
 
+# Updated Tabs (Removed Ad Campaign Analysis)
 tabs = st.tabs([
     "KPIs", 
     "YOY Trends", 
     "Daily Prices", 
     "SKU Trends", 
     "Pivot Table", 
-    "Ad Campaign Analysis",
     "Unrecognised Sales"
 ])
 
@@ -479,10 +447,15 @@ with tabs[1]:
             product_options = sorted(df["Product"].dropna().unique())
         selected_products = st.multiselect("Select Product(s)", options=product_options,
                                            default=[], key="yoy_products",
-                                           help="Select one or more products to filter (affects the line chart only).")
+                                           help="Select one or more products to filter (affects the line chart and summary).")
         time_grouping = "Week"
-    fig_yoy = create_yoy_trends_chart(df, yoy_years, selected_quarters, selected_channels, selected_listings, selected_products, time_grouping=time_grouping)
+        
+    # Create the YOY Trends chart as before
+    fig_yoy = create_yoy_trends_chart(df, yoy_years, selected_quarters,
+                                      selected_channels, selected_listings,
+                                      selected_products, time_grouping=time_grouping)
     st.plotly_chart(fig_yoy, use_container_width=True)
+    
     st.markdown("### Revenue Summary")
     st.markdown("")
     filtered_df = df.copy()
@@ -494,6 +467,10 @@ with tabs[1]:
         filtered_df = filtered_df[filtered_df["Sales Channel"].isin(selected_channels)]
     if selected_listings:
         filtered_df = filtered_df[filtered_df["Listing"].isin(selected_listings)]
+    # NEW: If a product filter is selected, apply it
+    if selected_products:
+        filtered_df = filtered_df[filtered_df["Product"].isin(selected_products)]
+    
     df_revenue = filtered_df.copy()
     if df_revenue.empty:
         st.info("No data available for the selected filters to build the revenue summary table.")
@@ -503,9 +480,11 @@ with tabs[1]:
         filtered_current_year = df_revenue["Year"].max()
         df_revenue_current = df_revenue[df_revenue["Year"] == filtered_current_year].copy()
         df_revenue_current["Week_Monday"] = df_revenue_current.apply(week_monday, axis=1)
-        df_revenue_current["Week_Sunday"] = df_revenue_current["Week_Monday"].apply(lambda d: d + datetime.timedelta(days=6) if d else None)
+        df_revenue_current["Week_Sunday"] = df_revenue_current["Week_Monday"].apply(
+            lambda d: d + datetime.timedelta(days=6) if d else None)
         today = datetime.date.today()
-        last_complete_week_end = today - datetime.timedelta(days=today.weekday() + 1) if today.weekday() != 6 else today
+        last_complete_week_end = (today - datetime.timedelta(days=today.weekday() + 1)
+                                  if today.weekday() != 6 else today)
         df_full_weeks_current = df_revenue_current[df_revenue_current["Week_Sunday"] <= last_complete_week_end].copy()
         unique_weeks_current = (
             df_full_weeks_current.groupby(["Year", "Week"])
@@ -521,7 +500,15 @@ with tabs[1]:
             last_week_number = last_week_tuple_current[1]
             last_4_weeks_current = unique_weeks_current.tail(4)
             last_4_week_numbers = last_4_weeks_current["Week"].tolist()
-            grouping_key = "Product" if selected_listings and len(selected_listings) == 1 else "Listing"
+            
+            # Adjust grouping key: if a product filter is selected, group by Product; otherwise use your Listing logic.
+            if selected_products:
+                grouping_key = "Product"
+            elif selected_listings and len(selected_listings) == 1:
+                grouping_key = "Product"
+            else:
+                grouping_key = "Listing"
+            
             rev_last_4_current = (df_full_weeks_current[
                 df_full_weeks_current["Week"].isin(last_4_week_numbers)
             ].groupby(grouping_key)["Sales Value (£)"]
@@ -794,65 +781,9 @@ with tabs[4]:
     st.dataframe(pivot, use_container_width=True)
 
 # -----------------------------------------
-# Tab 6: Ad Campaign Analysis
+# Tab 6: Unrecognised Sales
 # -----------------------------------------
 with tabs[5]:
-    st.markdown("### Ad Campaign Analysis")
-    if advertising_file is None:
-        st.info("Please upload an advertising dataset to view the analysis in this tab.")
-    else:
-        ad_data = load_ad_data(advertising_file)
-        st.markdown("## Campaign Comparison")
-        with st.expander("Compare Monthly Metrics", expanded=False):
-            if "Start Date" in ad_data.columns:
-                ad_data["Start Date"] = pd.to_datetime(ad_data["Start Date"], errors='coerce')
-                ad_data["Month"] = ad_data["Start Date"].dt.strftime("%B")
-                ad_data["Year"] = ad_data["Start Date"].dt.year
-                available_months = sorted(ad_data["Month"].dropna().unique(), key=lambda m: list(calendar.month_name).index(m))
-                available_years_ad = sorted(ad_data["Year"].dropna().unique())
-            else:
-                available_months = list(calendar.month_name)[1:]
-                available_years_ad = []
-            selected_month = st.selectbox("Select Month", options=available_months, index=0)
-            selected_ad_years = st.multiselect("Select Year(s)", options=available_years_ad, default=available_years_ad)
-            available_listings_ad = sorted(ad_data["Portfolio name"].dropna().unique())
-            selected_listing = st.selectbox("Select Listing", options=available_listings_ad, index=0)
-            filtered = ad_data[(ad_data["Month"] == selected_month) &
-                               (ad_data["Year"].isin(selected_ad_years)) &
-                               (ad_data["Portfolio name"] == selected_listing)]
-            if filtered.empty:
-                st.warning("No advertising data available for the selected month, years, and listing filter.")
-            else:
-                agg = filtered.groupby(["Campaign Name", "Year"]).agg({
-                    "7 Day Total Sales": "sum",
-                    "Spend": "sum"
-                }).reset_index()
-                agg.rename(columns={"7 Day Total Sales": "Revenue"}, inplace=True)
-                agg["ACOS"] = agg.apply(lambda row: (row["Spend"] / row["Revenue"] * 100) if row["Revenue"] > 0 else 0, axis=1)
-                category_orders = {"Year": sorted(filtered["Year"].unique())}
-                rev_fig = px.bar(agg, x="Campaign Name", y="Revenue", color="Year",
-                                 barmode="group", category_orders=category_orders,
-                                 title=f"Revenue for {selected_month} - {selected_listing}",
-                                 labels={"Revenue": "Revenue (£)", "Campaign Name": "Campaign"})
-                spend_fig = px.bar(agg, x="Campaign Name", y="Spend", color="Year",
-                                   barmode="group", category_orders=category_orders,
-                                   title=f"Spend for {selected_month} - {selected_listing}",
-                                   labels={"Spend": "Spend (£)", "Campaign Name": "Campaign"})
-                acos_fig = px.bar(agg, x="Campaign Name", y="ACOS", color="Year",
-                                  barmode="group", category_orders=category_orders,
-                                  title=f"ACOS (%) for {selected_month} - {selected_listing}",
-                                  labels={"ACOS": "ACOS (%)", "Campaign Name": "Campaign"})
-                st.plotly_chart(rev_fig, use_container_width=True)
-                st.plotly_chart(spend_fig, use_container_width=True)
-                st.plotly_chart(acos_fig, use_container_width=True)
-                st.markdown("### Available Campaigns for Selected Listing")
-                display_cols = ["Campaign Name", "Portfolio name", "Program Type", "Status", "Spend", "7 Day Total Sales", "Total Advertising Cost of Sales (ACOS)"]
-                st.dataframe(filtered[display_cols])
-                
-# -----------------------------------------
-# Tab 7: Unrecognised Sales
-# -----------------------------------------
-with tabs[6]:
     st.markdown("### Unrecognised Sales")
     unrecognised_sales = df[df["Listing"].str.contains("unrecognised", case=False, na=False)]
     columns_to_drop = ["Year", "Weekly Sales Value (£)", "YOY Growth (%)"]
