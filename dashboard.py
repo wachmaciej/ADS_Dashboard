@@ -544,8 +544,9 @@ with tabs[1]:
                     .astype(int)
                 )
             else:
-                rev_last_4_last_year = pd.Series(dtype=float)
-                rev_last_1_last_year = pd.Series(dtype=float)
+                # Assign names to the empty Series to avoid join errors
+                rev_last_4_last_year = pd.Series(dtype=float, name="Last 4 Weeks Revenue (Last Year)")
+                rev_last_1_last_year = pd.Series(dtype=float, name="Last Week Revenue (Last Year)")
             all_keys_current = pd.Series(sorted(df_revenue_current[grouping_key].unique()), name=grouping_key)
             revenue_summary = pd.DataFrame(all_keys_current).set_index(grouping_key)
             revenue_summary = revenue_summary.join(rev_last_4_current, how="left") \
