@@ -33,15 +33,6 @@ if uploaded_file is None:
 # FUNCTIONS
 # =============================================================================
 
-@st.cache_data(show_spinner=False)
-def load_data(file):
-    """Load main data from CSV or Excel file."""
-    if file.name.endswith(".csv"):
-        data = pd.read_csv(file)
-    else:
-        data = pd.read_excel(file)
-    return data
-
 def get_quarter(week):
     """Convert week number to quarter."""
     if 1 <= week <= 13:
@@ -64,14 +55,27 @@ def format_currency_int(value):
     return f"£{int(round(value)):,}"
 
 @st.cache_data(show_spinner=False)
+def load_data(file):
+    """Load main data from CSV or Excel file."""
+    if file.name.endswith(".csv"):
+        data = pd.read_csv(file)
+    else:
+        data = pd.read_excel(file)
+    return data
+
+@st.cache_data(show_spinner=False)
 def preprocess_data(data):
-    """Ensure necessary columns exist and add a 'Quarter' column."""
-    required_cols = {"Week", "Year", "Sales Value (£)"}
+    """Ensure necessary columns exist and add derived date columns and a 'Quarter' column."""
+    required_cols = {"Week", "Year", "Sales Value (£)", "Date"}
     if not required_cols.issubset(set(data.columns)):
         st.error(f"Dataset is missing one or more required columns: {required_cols}")
         st.stop()
-    if "Week" in data.columns:
-        data["Quarter"] = data["Week"].apply(get_quarter)
+    # Convert Date to datetime and derive year and week from Date column
+    data["Date"] = pd.to_datetime(data["Date"], errors='coerce')
+    data["Year_from_date"] = data["Date"].dt.year
+    data["Week_from_date"] = data["Date"].dt.isocalendar().week
+    # Retain original Quarter calculation based on Week column if needed
+    data["Quarter"] = data["Week"].apply(get_quarter)
     return data
 
 def week_monday(row):
@@ -290,6 +294,14 @@ def create_daily_price_chart(data, listing, selected_years, selected_quarters, s
 df = load_data(uploaded_file)
 df = preprocess_data(df)
 
+# For KPI tab, use year derived from Date column
+available_years_date = sorted(df["Year_from_date"].dropna().unique())
+if not available_years_date:
+    st.error("No year data available based on the Date column.")
+    st.stop()
+current_year_date = available_years_date[-1]
+
+# The rest of the tabs might continue using the original Year column if required
 available_years = sorted(df["Year"].dropna().unique())
 if not available_years:
     st.error("No year data available.")
@@ -313,7 +325,7 @@ tabs = st.tabs([
 ])
 
 # -----------------------------------------
-# Tab 1: KPIs
+# Tab 1: KPIs (Using Date-derived Year and Week)
 # -----------------------------------------
 with tabs[0]:
     st.markdown("### Key Performance Indicators")
@@ -321,31 +333,32 @@ with tabs[0]:
         today = datetime.date.today()
         last_full_week_end = today - datetime.timedelta(days=today.weekday() + 1) if today.weekday() != 6 else today
         default_week = last_full_week_end.isocalendar()[1]
-        available_weeks = sorted(df["Week"].dropna().unique())
+        # Use weeks from Date-derived column for the current year based on Date
+        available_weeks = sorted(df[df["Year_from_date"] == current_year_date]["Week_from_date"].dropna().unique())
         default_index = available_weeks.index(default_week) if default_week in available_weeks else 0
         selected_week = st.selectbox("Select Week for KPI Calculation",
                                      options=available_weeks,
                                      index=default_index,
                                      key="kpi_week",
                                      help="Select the week to calculate KPIs for. (Defaults to the last full week)")
-        monday, sunday = get_week_date_range(current_year, selected_week)
+        monday, sunday = get_week_date_range(current_year_date, selected_week)
         if monday and sunday:
             st.info(f"Wk {selected_week}: {monday.strftime('%d %b')} - {sunday.strftime('%d %b, %Y')}")
-    kpi_data = df[df["Week"] == selected_week]
-    kpi_summary = kpi_data.groupby("Year")["Sales Value (£)"].sum()
-    all_years = sorted(df["Year"].dropna().unique())
-    kpi_summary = kpi_summary.reindex(all_years, fill_value=0)
-    kpi_cols = st.columns(len(all_years))
-    for idx, year in enumerate(all_years):
+    # Filter KPI data based on Date-derived week
+    kpi_data = df[df["Week_from_date"] == selected_week]
+    kpi_summary = kpi_data.groupby("Year_from_date")["Sales Value (£)"].sum()
+    all_years_date = sorted(df["Year_from_date"].dropna().unique())
+    kpi_cols = st.columns(len(all_years_date))
+    for idx, year in enumerate(all_years_date):
         with kpi_cols[idx]:
             st.subheader(f"Year {year}")
             st.markdown(f"<div style='font-size: 1.2em;'>Week {selected_week} Revenue</div>", unsafe_allow_html=True)
-            if kpi_summary[year] == 0:
+            if kpi_summary.get(year, 0) == 0:
                 st.write("Revenue: N/A")
             else:
-                revenue_str = format_currency_int(kpi_summary[year])
+                revenue_str = format_currency_int(kpi_summary.get(year, 0))
                 if idx > 0:
-                    delta_val = int(round(kpi_summary[year] - kpi_summary[all_years[idx - 1]]))
+                    delta_val = int(round(kpi_summary.get(year, 0) - kpi_summary.get(all_years_date[idx - 1], 0)))
                     if delta_val > 0:
                         delta_display = f"↑ {delta_val:,}"
                         color = "green"
@@ -361,65 +374,6 @@ with tabs[0]:
                 st.markdown(f"<div style='font-size: 1.5em;'>{revenue_str}</div>", unsafe_allow_html=True)
                 if delta_display:
                     st.markdown(f"<div style='font-size: 1.2em; color: {color};'>{delta_display}</div>", unsafe_allow_html=True)
-    st.markdown("---")
-    st.subheader(f"Top Gainers and Losers for Week {selected_week} ({current_year})")
-    current_year_data = df[df["Year"] == current_year]
-    week_data_current = current_year_data[current_year_data["Week"] == selected_week]
-    if selected_week > 1:
-        previous_week = selected_week - 1
-        week_data_prev = current_year_data[current_year_data["Week"] == previous_week]
-    else:
-        previous_years = [year for year in available_years if year < current_year]
-        if previous_years:
-            prev_year = max(previous_years)
-            week_data_prev = df[(df["Year"] == prev_year) & (df["Week"] == 52)]
-        else:
-            week_data_prev = pd.DataFrame(columns=current_year_data.columns)
-    rev_current = week_data_current.groupby("Listing")["Sales Value (£)"].sum()
-    rev_previous = week_data_prev.groupby("Listing")["Sales Value (£)"].sum()
-    combined = pd.concat([rev_current, rev_previous], axis=1, keys=["Current", "Previous"]).fillna(0)
-    def compute_abs_change(row):
-        return None if row["Previous"] == 0 else (row["Current"] - row["Previous"])
-    combined["abs_change"] = combined.apply(compute_abs_change, axis=1)
-    num_items = 3
-    top_gainers = combined[combined["abs_change"].notnull()].sort_values("abs_change", ascending=False).head(num_items)
-    top_losers = combined[combined["abs_change"].notnull()].sort_values("abs_change", ascending=True).head(num_items)
-    def format_abs_change(val):
-        if val is None:
-            return "<span style='color:gray;'>N/A</span>"
-        if val > 0:
-            return f"<span style='color:green;'>↑ {int(round(val)):,}</span>"
-        elif val < 0:
-            return f"<span style='color:red;'>↓ {int(round(abs(val))):,}</span>"
-        else:
-            return f"<span style='color:gray;'>→ {int(round(val)):,}</span>"
-    col1, col2 = st.columns([1, 1])
-    with col1:
-        st.markdown("<div style='text-align:center;'><h4>Top Gainers</h4></div>", unsafe_allow_html=True)
-        if top_gainers.empty:
-            st.info("No gainers data available for this week.")
-        else:
-            for listing, row in top_gainers.iterrows():
-                change_html = format_abs_change(row["abs_change"])
-                st.markdown(f"""
-                    <div style="background:#94f7bb; color:black; padding:10px; border-radius:8px; margin-bottom:8px; text-align:center;">
-                        <strong>{listing}</strong><br>
-                        {change_html}<br>{format_currency_int(row['Current'])}
-                    </div>
-                """, unsafe_allow_html=True)
-    with col2:
-        st.markdown("<div style='text-align:center;'><h4>Top Losers</h4></div>", unsafe_allow_html=True)
-        if top_losers.empty:
-            st.info("No losers data available for this week.")
-        else:
-            for listing, row in top_losers.iterrows():
-                change_html = format_abs_change(row["abs_change"])
-                st.markdown(f"""
-                    <div style="background:#fcb8b8; color:black; padding:10px; border-radius:8px; margin-bottom:8px; text-align:center;">
-                        <strong>{listing}</strong><br>
-                        {change_html}<br>{format_currency_int(row['Current'])}
-                    </div>
-                """, unsafe_allow_html=True)
 
 # -----------------------------------------
 # Tab 2: YOY Trends
@@ -555,16 +509,32 @@ with tabs[1]:
                                              .join(rev_last_1_last_year, how="left")
             revenue_summary = revenue_summary.fillna(0)
             revenue_summary = revenue_summary.reset_index()
+            
+            # Calculate differences
+            revenue_summary["Last 4 Weeks Diff"] = revenue_summary["Last 4 Weeks Revenue (Current Year)"] - revenue_summary["Last 4 Weeks Revenue (Last Year)"]
+            revenue_summary["Last Week Diff"] = revenue_summary["Last Week Revenue (Current Year)"] - revenue_summary["Last Week Revenue (Last Year)"]
+            # Calculate percentage changes (if last year's revenue is 0, set to 0)
+            revenue_summary["Last 4 Weeks % Change"] = revenue_summary.apply(
+                lambda row: (row["Last 4 Weeks Diff"] / row["Last 4 Weeks Revenue (Last Year)"] * 100) if row["Last 4 Weeks Revenue (Last Year)"] != 0 else 0,
+                axis=1
+            )
+            revenue_summary["Last Week % Change"] = revenue_summary.apply(
+                lambda row: (row["Last Week Diff"] / row["Last Week Revenue (Last Year)"] * 100) if row["Last Week Revenue (Last Year)"] != 0 else 0,
+                axis=1
+            )
+            # Define the desired column order
             desired_order = [grouping_key,
                              "Last 4 Weeks Revenue (Current Year)",
                              "Last 4 Weeks Revenue (Last Year)",
                              "Last 4 Weeks Diff",
+                             "Last 4 Weeks % Change",
                              "Last Week Revenue (Current Year)",
                              "Last Week Revenue (Last Year)",
-                             "Last Week Diff"]
-            revenue_summary["Last 4 Weeks Diff"] = revenue_summary["Last 4 Weeks Revenue (Current Year)"] - revenue_summary["Last 4 Weeks Revenue (Last Year)"]
-            revenue_summary["Last Week Diff"] = revenue_summary["Last Week Revenue (Current Year)"] - revenue_summary["Last Week Revenue (Last Year)"]
+                             "Last Week Diff",
+                             "Last Week % Change"]
             revenue_summary = revenue_summary[desired_order]
+            
+            # Create summary (total) row
             summary_row = {
                 grouping_key: "Total",
                 "Last 4 Weeks Revenue (Current Year)": revenue_summary["Last 4 Weeks Revenue (Current Year)"].sum(),
@@ -574,8 +544,13 @@ with tabs[1]:
                 "Last 4 Weeks Diff": revenue_summary["Last 4 Weeks Diff"].sum(),
                 "Last Week Diff": revenue_summary["Last Week Diff"].sum()
             }
+            total_last4_last_year = summary_row["Last 4 Weeks Revenue (Last Year)"]
+            total_last_week_last_year = summary_row["Last Week Revenue (Last Year)"]
+            summary_row["Last 4 Weeks % Change"] = (summary_row["Last 4 Weeks Diff"] / total_last4_last_year * 100) if total_last4_last_year != 0 else 0
+            summary_row["Last Week % Change"] = (summary_row["Last Week Diff"] / total_last_week_last_year * 100) if total_last_week_last_year != 0 else 0
             total_df = pd.DataFrame([summary_row])
             total_df = total_df[desired_order]
+            
             def color_diff(val):
                 try:
                     if val < 0:
@@ -586,6 +561,7 @@ with tabs[1]:
                         return ''
                 except Exception:
                     return ''
+            # Apply the color function to both diff and percentage columns
             styled_total = (
                 total_df.style
                 .format({
@@ -594,9 +570,11 @@ with tabs[1]:
                     "Last Week Revenue (Current Year)": "{:,}",
                     "Last Week Revenue (Last Year)": "{:,}",
                     "Last 4 Weeks Diff": "{:,.0f}",
-                    "Last Week Diff": "{:,.0f}"
+                    "Last Week Diff": "{:,.0f}",
+                    "Last 4 Weeks % Change": "{:.1f}%",
+                    "Last Week % Change": "{:.1f}%"
                 })
-                .applymap(color_diff, subset=["Last 4 Weeks Diff", "Last Week Diff"])
+                .applymap(color_diff, subset=["Last 4 Weeks Diff", "Last Week Diff", "Last 4 Weeks % Change", "Last Week % Change"])
                 .set_properties(**{'font-weight': 'bold'})
             )
             styled_main = (
@@ -607,9 +585,11 @@ with tabs[1]:
                     "Last Week Revenue (Current Year)": "{:,}",
                     "Last Week Revenue (Last Year)": "{:,}",
                     "Last 4 Weeks Diff": "{:,.0f}",
-                    "Last Week Diff": "{:,.0f}"
+                    "Last Week Diff": "{:,.0f}",
+                    "Last 4 Weeks % Change": "{:.1f}%",
+                    "Last Week % Change": "{:.1f}%"
                 })
-                .applymap(color_diff, subset=["Last 4 Weeks Diff", "Last Week Diff"])
+                .applymap(color_diff, subset=["Last 4 Weeks Diff", "Last Week Diff", "Last 4 Weeks % Change", "Last Week % Change"])
             )
             st.markdown("##### Total Summary")
             st.dataframe(styled_total, use_container_width=True)
