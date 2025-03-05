@@ -7,7 +7,6 @@ import calendar
 from plotly.subplots import make_subplots
 import plotly.graph_objects as go
 import re
-from statsmodels.tsa.holtwinters import ExponentialSmoothing
 
 # Filter warnings for a clean output
 warnings.filterwarnings("ignore")
