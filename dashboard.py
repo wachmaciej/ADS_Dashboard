@@ -17,39 +17,7 @@ st.set_page_config(page_title="YOY Dashboard", page_icon=":chart_with_upwards_tr
 # --- Inject Custom CSS ---
 st.markdown("""
     <style>
-    /* KPI Card Styles */
-    .kpi-card {
-        background: #f9f9f9;
-        border-radius: 8px;
-        padding: 15px;
-        margin-bottom: 20px;
-        box-shadow: 2px 2px 8px rgba(0,0,0,0.1);
-    }
-    .kpi-title {
-        font-size: 1.4em;
-        font-weight: bold;
-        margin-bottom: 5px;
-    }
-    .kpi-label {
-        font-size: 1.2em;
-        margin-top: 5px;
-    }
-    .kpi-value {
-        font-size: 1.8em;
-        font-weight: bold;
-        color: inherit;
-    }
-    .kpi-delta {
-        font-size: 1.2em;
-        margin-top: 3px;
-    }
-    /* Remove white backgrounds from horizontal blocks and columns */
-    [data-testid="stHorizontalBlock"] > div,
-    [data-testid="column"] {
-        background-color: transparent !important;
-        box-shadow: none !important;
-        border: none !important;
-    }
+    /* Additional CSS can go here if needed */
     </style>
 """, unsafe_allow_html=True)
 
@@ -222,8 +190,7 @@ def create_pivot_table(data, selected_years, selected_quarters, selected_channel
     pivot = pivot.rename(columns=new_columns)
     return pivot
 
-# Updated SKU Line Chart function with week_range filtering
-def create_sku_line_chart(data, sku_text, selected_years, selected_quarters, selected_channels=None, week_range=None):
+def create_sku_line_chart(data, sku_text, selected_years, selected_channels=None, week_range=None):
     if "Product SKU" not in data.columns:
         st.error("The dataset does not contain a 'Product SKU' column.")
         st.stop()
@@ -232,8 +199,6 @@ def create_sku_line_chart(data, sku_text, selected_years, selected_quarters, sel
     filtered = filtered[filtered["Product SKU"].str.contains(sku_text, case=False, na=False)]
     if selected_years:
         filtered = filtered[filtered["Custom_Week_Year"].isin(selected_years)]
-    if selected_quarters and "All Quarters" not in selected_quarters:
-        filtered = filtered[filtered["Quarter"].isin(selected_quarters)]
     if selected_channels and len(selected_channels) > 0:
         filtered = filtered[filtered["Sales Channel"].isin(selected_channels)]
     
@@ -252,8 +217,6 @@ def create_sku_line_chart(data, sku_text, selected_years, selected_quarters, sel
     weekly_sku["RevenueK"] = weekly_sku["Sales Value (£)"] / 1000
     if week_range:
         min_week, max_week = week_range
-    elif selected_quarters and "All Quarters" not in selected_quarters and not filtered.empty:
-        min_week, max_week = int(filtered["Week"].min()), int(filtered["Week"].max())
     else:
         min_week, max_week = 1, 52
     
@@ -361,15 +324,18 @@ tabs = st.tabs([
 ])
 
 # -----------------------------------------
-# Tab 1: KPIs
+# Tab 1: KPIs using st.metric with updated delta formatting
 # -----------------------------------------
 with tabs[0]:
     st.markdown("### Key Performance Indicators")
     with st.expander("KPI Filters", expanded=False):
         today = datetime.date.today()
-        _, _, _, _ = compute_custom_week(today)
+        # Get weeks for the current custom year
         available_weeks = sorted(df[df["Custom_Week_Year"] == current_custom_year]["Custom_Week"].dropna().unique())
-        default_week = available_weeks[-1] if available_weeks else 1
+        # Filter to only full weeks (week_end is on or before today)
+        full_weeks = [wk for wk in available_weeks if get_custom_week_date_range(current_custom_year, wk)[1] <= today]
+        default_week = full_weeks[-1] if full_weeks else (available_weeks[-1] if available_weeks else 1)
+        
         selected_week = st.selectbox(
             "Select Week for KPI Calculation",
             options=available_weeks,
@@ -380,88 +346,71 @@ with tabs[0]:
         week_start_custom, week_end_custom = get_custom_week_date_range(current_custom_year, selected_week)
         st.info(f"Week {selected_week}: {week_start_custom.strftime('%d %b')} - {week_end_custom.strftime('%d %b, %Y')}")
     
+    # Filter data for the selected week
     kpi_data = df[df["Custom_Week"] == selected_week]
     revenue_summary = kpi_data.groupby("Custom_Week_Year")["Sales Value (£)"].sum()
     if "Order Quantity" in kpi_data.columns:
         units_summary = kpi_data.groupby("Custom_Week_Year")["Order Quantity"].sum()
     else:
         units_summary = None
+    # Use all custom years from the full dataset
     all_custom_years = sorted(df["Custom_Week_Year"].dropna().unique())
     
+    # Display KPIs using st.metric in columns
     kpi_cols = st.columns(len(all_custom_years))
     for idx, year in enumerate(all_custom_years):
         with kpi_cols[idx]:
-            st.markdown(f"<div class='kpi-card'>", unsafe_allow_html=True)
-            st.markdown(f"<div class='kpi-title'>Year {year}</div>", unsafe_allow_html=True)
-            
-            # Revenue block with icon
-            st.markdown(f"<div class='kpi-label'>💰 Week {selected_week} Revenue</div>", unsafe_allow_html=True)
+            # Revenue Metric (absolute difference)
             revenue = revenue_summary.get(year, 0)
-            if revenue == 0:
-                st.markdown(f"<div class='kpi-value'>N/A</div>", unsafe_allow_html=True)
+            if idx > 0:
+                prev_rev = revenue_summary.get(all_custom_years[idx - 1], 0)
+                delta_rev = revenue - prev_rev
+                delta_rev_str = f"{int(round(delta_rev)):,}"
             else:
-                revenue_str = format_currency_int(revenue)
-                if idx > 0:
-                    prev_rev = revenue_summary.get(all_custom_years[idx - 1], 0)
-                    delta_val = int(round(revenue - prev_rev))
-                    if delta_val > 0:
-                        delta_display = f"↑ {delta_val:,}"
-                        color = "green"
-                    elif delta_val < 0:
-                        delta_display = f"↓ -{abs(delta_val):,}"
-                        color = "red"
-                    else:
-                        delta_display = ""
-                        color = "inherit"
-                else:
-                    delta_display = ""
-                    color = "inherit"
-                st.markdown(f"<div class='kpi-value'>{revenue_str}</div>", unsafe_allow_html=True)
-                if delta_display:
-                    st.markdown(f"<div class='kpi-delta' style='color:{color};'>{delta_display}</div>", unsafe_allow_html=True)
-            
-            # Insert horizontal rule and spacing
-            st.markdown('---')
-            st.markdown('<br>', unsafe_allow_html=True)
-            
-            # Additional KPIs: Total Units Sold and AOV
+                delta_rev_str = ""
+            if revenue == 0:
+                st.metric(label=f"Revenue {year} (Week {selected_week})", value="N/A")
+            else:
+                st.metric(
+                    label=f"Revenue {year} (Week {selected_week})",
+                    value=format_currency_int(revenue),
+                    delta=delta_rev_str
+                )
+            # Total Units Sold Metric (with percentage change)
             if units_summary is not None:
                 total_units = units_summary.get(year, 0)
-                if year == min(all_custom_years):
-                    units_pct_change_text = ""
-                else:
+                if idx > 0:
                     prev_units = units_summary.get(all_custom_years[idx - 1], 0)
                     if prev_units != 0:
-                        units_pct_change = ((total_units - prev_units) / prev_units) * 100
+                        delta_units_percent = ((total_units - prev_units) / prev_units) * 100
                     else:
-                        units_pct_change = 0
-                    color_units = "green" if units_pct_change > 0 else ("red" if units_pct_change < 0 else "inherit")
-                    units_pct_change_text = f" (<span style='color:{color_units};'>{units_pct_change:+.1f}%</span>)"
-                st.markdown(
-                    f"<div class='kpi-label'>📦 Total Units Sold: {total_units:,}{units_pct_change_text}</div>",
-                    unsafe_allow_html=True)
-                
-                if total_units != 0:
-                    aov = revenue / total_units
+                        delta_units_percent = 0
+                    delta_units_str = f"{delta_units_percent:.1f}%"
                 else:
-                    aov = 0
-                if year == min(all_custom_years):
-                    aov_pct_change_text = ""
-                else:
+                    delta_units_str = ""
+                st.metric(
+                    label=f"Total Units Sold {year}",
+                    value=f"{total_units:,}",
+                    delta=delta_units_str
+                )
+                # Average Order Value (AOV) Metric with percentage change
+                aov = revenue / total_units if total_units != 0 else 0
+                if idx > 0:
                     prev_total_units = units_summary.get(all_custom_years[idx - 1], 0)
-                    prev_revenue = revenue_summary.get(all_custom_years[idx - 1], 0)
-                    prev_aov = prev_revenue / prev_total_units if prev_total_units != 0 else 0
+                    prev_rev = revenue_summary.get(all_custom_years[idx - 1], 0)
+                    prev_aov = prev_rev / prev_total_units if prev_total_units != 0 else 0
                     if prev_aov != 0:
-                        aov_pct_change = ((aov - prev_aov) / prev_aov) * 100
+                        delta_aov_percent = ((aov - prev_aov) / prev_aov) * 100
                     else:
-                        aov_pct_change = 0
-                    color_aov = "green" if aov_pct_change > 0 else ("red" if aov_pct_change < 0 else "inherit")
-                    aov_pct_change_text = f" (<span style='color:{color_aov};'>{aov_pct_change:+.1f}%</span>)"
-                st.markdown(
-                    f"<div class='kpi-label'>📊 Average Order Value: £{aov:,.2f}{aov_pct_change_text}</div>",
-                    unsafe_allow_html=True)
-            
-            st.markdown("</div>", unsafe_allow_html=True)
+                        delta_aov_percent = 0
+                    delta_aov_str = f"{delta_aov_percent:.1f}%"
+                else:
+                    delta_aov_str = ""
+                st.metric(
+                    label=f"AOV {year} (Week {selected_week})",
+                    value=f"£{aov:,.2f}",
+                    delta=delta_aov_str
+                )
 
 # -----------------------------------------
 # Tab 2: YOY Trends
@@ -674,7 +623,7 @@ with tabs[2]:
             st.plotly_chart(fig_comp, use_container_width=True)
 
 # -----------------------------------------
-# Tab 4: SKU Trends
+# Tab 4: SKU Trends 
 # -----------------------------------------
 with tabs[3]:
     st.markdown("### SKU Trends")
@@ -684,25 +633,19 @@ with tabs[3]:
         with st.expander("SKU Chart Filters", expanded=True):
             sku_text = st.text_input("Enter Product SKU", value="", key="sku_input", help="Enter a SKU (or part of it) to display its weekly revenue trends.")
             sku_years = st.multiselect("Select Year(s)", options=available_custom_years, default=default_current_year, key="sku_years", help="Default is the current custom week year.")
-            sku_quarters = st.multiselect("Select Quarter(s)", options=["All Quarters", "Q1", "Q2", "Q3", "Q4"], default=["All Quarters"], key="sku_quarters", help="Select one or more quarters for SKU trends. 'All Quarters' means no quarter filtering.")
             sku_channels = st.multiselect("Select Sales Channel(s)", options=sorted(df["Sales Channel"].dropna().unique()), default=[], key="sku_channels", help="Select one or more sales channels to filter SKU trends. If empty, all channels are shown.")
-            # Week range selector slider (from week 1 to week 52)
             week_range = st.slider("Select Week Range", min_value=1, max_value=52, value=(1, 52), step=1, key="sku_week_range", help="Select the range of weeks to display.")
         
         if sku_text.strip() == "":
             st.info("Please enter a Product SKU to view its trends.")
         else:
-            # Create the SKU trends chart using the selected week range filter
-            fig_sku = create_sku_line_chart(df, sku_text, sku_years, sku_quarters, selected_channels=sku_channels, week_range=week_range)
+            fig_sku = create_sku_line_chart(df, sku_text, sku_years, selected_channels=sku_channels, week_range=week_range)
             if fig_sku is not None:
                 st.plotly_chart(fig_sku, use_container_width=True)
             
-            # Additional SKU breakdown tables with week range filtering
             filtered_sku_data = df[df["Product SKU"].str.contains(sku_text, case=False, na=False)]
             if sku_years:
                 filtered_sku_data = filtered_sku_data[filtered_sku_data["Custom_Week_Year"].isin(sku_years)]
-            if sku_quarters and "All Quarters" not in sku_quarters:
-                filtered_sku_data = filtered_sku_data[filtered_sku_data["Quarter"].isin(sku_quarters)]
             if sku_channels and len(sku_channels) > 0:
                 filtered_sku_data = filtered_sku_data[filtered_sku_data["Sales Channel"].isin(sku_channels)]
             if week_range:
