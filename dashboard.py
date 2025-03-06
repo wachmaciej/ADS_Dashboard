@@ -389,7 +389,7 @@ with tabs[0]:
                 else:
                     delta_units_str = ""
                 st.metric(
-                    label=f"Total Units Sold {year}",
+                    label=f"Total Units Sold {year} (Week {selected_week})",
                     value=f"{total_units:,}",
                     delta=delta_units_str
                 )
