@@ -7,19 +7,13 @@ import calendar
 from plotly.subplots import make_subplots
 import plotly.graph_objects as go
 import re
+import io
 
 # Filter warnings for a clean output
 warnings.filterwarnings("ignore")
 
 # --- Page Configuration ---
 st.set_page_config(page_title="YOY Dashboard", page_icon=":chart_with_upwards_trend:", layout="wide")
-
-# --- Inject Custom CSS ---
-st.markdown("""
-    <style>
-    /* Additional CSS can go here if needed */
-    </style>
-""", unsafe_allow_html=True)
 
 # --- Title and Logo ---
 col1, col2 = st.columns([3, 1])
@@ -28,23 +22,17 @@ with col1:
 with col2:
     st.image("logo.png", width=300)
 
-# --- Sidebar Uploaders ---
-uploaded_file = st.sidebar.file_uploader("Upload Main Dataset (CSV or Excel)", type=["csv", "xlsx"])
-if uploaded_file is None:
-    st.info("Please use the file uploader in the sidebar to upload your main dataset and view the dashboard.")
-    st.stop()
+# Initialize session state keys for data if not already set
+if "sales_data" not in st.session_state:
+    st.session_state["sales_data"] = None
+   
+# --- Sidebar ---
+st.sidebar.header("YOY Dashboard")
 
 # =============================================================================
-# CUSTOM WEEK FUNCTIONS
+# Helper Functions for Sales Data
 # =============================================================================
 def compute_custom_week(date):
-    """
-    For a given date (a datetime.date object), compute:
-      - custom_week: the week number (week starts on Saturday, ends on Friday)
-      - custom_year: the year corresponding to the week's Friday
-      - week_start: the Saturday starting that week
-      - week_end: the following Friday
-    """
     custom_dow = (date.weekday() + 2) % 7  # Saturday=0, Sunday=1, ..., Friday=6
     week_start = date - datetime.timedelta(days=custom_dow)
     week_end = week_start + datetime.timedelta(days=6)
@@ -56,9 +44,6 @@ def compute_custom_week(date):
     return custom_week, custom_year, week_start, week_end
 
 def get_custom_week_date_range(week_year, week_number):
-    """
-    Returns the start (Saturday) and end (Friday) dates for a given custom week.
-    """
     first_day = datetime.date(week_year, 1, 1)
     first_day_custom_dow = (first_day.weekday() + 2) % 7
     first_week_start = first_day - datetime.timedelta(days=first_day_custom_dow)
@@ -66,9 +51,6 @@ def get_custom_week_date_range(week_year, week_number):
     week_end = week_start + datetime.timedelta(days=6)
     return week_start, week_end
 
-# =============================================================================
-# OTHER HELPER FUNCTIONS
-# =============================================================================
 def get_quarter(week):
     if 1 <= week <= 13:
         return "Q1"
@@ -110,15 +92,6 @@ def preprocess_data(data):
     data["Quarter"] = data["Week"].apply(get_quarter)
     return data
 
-def week_monday(row):
-    try:
-        return datetime.date.fromisocalendar(int(row["Year"]), int(row["Week"]), 1)
-    except Exception:
-        return None
-
-# =============================================================================
-# CHART AND TABLE FUNCTIONS
-# =============================================================================
 def create_yoy_trends_chart(data, selected_years, selected_quarters,
                             selected_channels=None, selected_listings=None,
                             selected_products=None, time_grouping="Week"):
@@ -166,7 +139,7 @@ def create_yoy_trends_chart(data, selected_years, selected_quarters,
     return fig
 
 def create_pivot_table(data, selected_years, selected_quarters, selected_channels,
-                       selected_listings, selected_products, grouping_key="Listing"):
+                           selected_listings, selected_products, grouping_key="Listing"):
     filtered = data.copy()
     if selected_years:
         filtered = filtered[filtered["Custom_Week_Year"].isin(selected_years)]
@@ -229,7 +202,7 @@ def create_sku_line_chart(data, sku_text, selected_years, selected_channels=None
                       margin=dict(t=50, b=50))
     return fig
 
-def create_daily_price_chart(data, listing, selected_years, selected_quarters, selected_channels):
+def create_daily_price_chart(data, listing, selected_years, selected_quarters, selected_channels, week_range=None):
     if "Date" not in data.columns:
         st.error("The dataset does not contain a 'Date' column required for daily price analysis.")
         return None
@@ -239,6 +212,11 @@ def create_daily_price_chart(data, listing, selected_years, selected_quarters, s
         df_listing = df_listing[df_listing["Quarter"].isin(selected_quarters)]
     if selected_channels and len(selected_channels) > 0:
         df_listing = df_listing[df_listing["Sales Channel"].isin(selected_channels)]
+    # Filter by week range if provided
+    if week_range:
+        start_week, end_week = week_range
+        df_listing = df_listing[(df_listing["Custom_Week"] >= start_week) & (df_listing["Custom_Week"] <= end_week)]
+    
     if df_listing.empty:
         st.warning(f"No data available for {listing} for the selected filters.")
         return None
@@ -294,9 +272,18 @@ def create_daily_price_chart(data, listing, selected_years, selected_quarters, s
     return fig
 
 # =============================================================================
-# MAIN CODE
+# Main Dashboard Code
 # =============================================================================
-df = load_data(uploaded_file)
+
+# --- Sales Data File Uploader ---
+uploaded_file = st.sidebar.file_uploader("Upload Sales Data (CSV or Excel)", type=["csv", "xlsx"], key="sales_file")
+if uploaded_file is not None:
+    st.session_state["sales_data"] = load_data(uploaded_file)
+if st.session_state["sales_data"] is None:
+    st.info("Please use the file uploader in the sidebar to upload your Sales Data and view the dashboard.")
+    st.stop()
+
+df = st.session_state["sales_data"]
 df = preprocess_data(df)
 
 available_custom_years = sorted(df["Custom_Week_Year"].dropna().unique())
@@ -308,12 +295,10 @@ if len(available_custom_years) >= 2:
     prev_custom_year = available_custom_years[-2]
     yoy_default_years = [prev_custom_year, current_custom_year]
 else:
+    selected_daily_quarters = []
     yoy_default_years = [current_custom_year]
 default_current_year = [current_custom_year]
 
-# -----------------------------------------
-# Tab Setup
-# -----------------------------------------
 tabs = st.tabs([
     "KPIs", 
     "YOY Trends", 
@@ -323,19 +308,16 @@ tabs = st.tabs([
     "Unrecognised Sales"
 ])
 
-# -----------------------------------------
-# Tab 1: KPIs using st.metric with updated delta formatting
-# -----------------------------------------
+# -------------------------------
+# Tab 1: KPIs
+# -------------------------------
 with tabs[0]:
     st.markdown("### Key Performance Indicators")
     with st.expander("KPI Filters", expanded=False):
         today = datetime.date.today()
-        # Get weeks for the current custom year
         available_weeks = sorted(df[df["Custom_Week_Year"] == current_custom_year]["Custom_Week"].dropna().unique())
-        # Filter to only full weeks (week_end is on or before today)
         full_weeks = [wk for wk in available_weeks if get_custom_week_date_range(current_custom_year, wk)[1] <= today]
         default_week = full_weeks[-1] if full_weeks else (available_weeks[-1] if available_weeks else 1)
-        
         selected_week = st.selectbox(
             "Select Week for KPI Calculation",
             options=available_weeks,
@@ -345,22 +327,16 @@ with tabs[0]:
         )
         week_start_custom, week_end_custom = get_custom_week_date_range(current_custom_year, selected_week)
         st.info(f"Week {selected_week}: {week_start_custom.strftime('%d %b')} - {week_end_custom.strftime('%d %b, %Y')}")
-    
-    # Filter data for the selected week
     kpi_data = df[df["Custom_Week"] == selected_week]
     revenue_summary = kpi_data.groupby("Custom_Week_Year")["Sales Value (£)"].sum()
     if "Order Quantity" in kpi_data.columns:
         units_summary = kpi_data.groupby("Custom_Week_Year")["Order Quantity"].sum()
     else:
         units_summary = None
-    # Use all custom years from the full dataset
     all_custom_years = sorted(df["Custom_Week_Year"].dropna().unique())
-    
-    # Display KPIs using st.metric in columns
     kpi_cols = st.columns(len(all_custom_years))
     for idx, year in enumerate(all_custom_years):
         with kpi_cols[idx]:
-            # Revenue Metric (absolute difference)
             revenue = revenue_summary.get(year, 0)
             if idx > 0:
                 prev_rev = revenue_summary.get(all_custom_years[idx - 1], 0)
@@ -376,7 +352,6 @@ with tabs[0]:
                     value=format_currency_int(revenue),
                     delta=delta_rev_str
                 )
-            # Total Units Sold Metric (with percentage change)
             if units_summary is not None:
                 total_units = units_summary.get(year, 0)
                 if idx > 0:
@@ -393,7 +368,6 @@ with tabs[0]:
                     value=f"{total_units:,}",
                     delta=delta_units_str
                 )
-                # Average Order Value (AOV) Metric with percentage change
                 aov = revenue / total_units if total_units != 0 else 0
                 if idx > 0:
                     prev_total_units = units_summary.get(all_custom_years[idx - 1], 0)
@@ -522,6 +496,8 @@ with tabs[1]:
                              "Last Week Diff",
                              "Last Week % Change"]
             revenue_summary = revenue_summary[desired_order]
+            
+            # ---- Total Summary Table ----
             summary_row = {
                 grouping_key: "Total",
                 "Last 4 Weeks Revenue (Current Year)": revenue_summary["Last 4 Weeks Revenue (Current Year)"].sum(),
@@ -557,6 +533,10 @@ with tabs[1]:
                 "Last Week % Change": "{:.1f}%"
             }).applymap(color_diff, subset=["Last 4 Weeks Diff", "Last Week Diff", "Last 4 Weeks % Change", "Last Week % Change"])\
               .set_properties(**{'font-weight': 'bold'})
+            st.markdown("##### Total Summary")
+            st.dataframe(styled_total, use_container_width=True)
+            
+            # ---- Detailed Summary Table ----
             styled_main = revenue_summary.style.format({
                 "Last 4 Weeks Revenue (Current Year)": "{:,}",
                 "Last 4 Weeks Revenue (Last Year)": "{:,}",
@@ -567,18 +547,16 @@ with tabs[1]:
                 "Last 4 Weeks % Change": "{:.1f}%",
                 "Last Week % Change": "{:.1f}%"
             }).applymap(color_diff, subset=["Last 4 Weeks Diff", "Last Week Diff", "Last 4 Weeks % Change", "Last Week % Change"])
-            st.markdown("##### Total Summary")
-            st.dataframe(styled_total, use_container_width=True)
             st.markdown("##### Detailed Summary")
             st.dataframe(styled_main, use_container_width=True)
-
-# -----------------------------------------
+        
+# -------------------------------
 # Tab 3: Daily Prices
-# -----------------------------------------
+# -------------------------------
 with tabs[2]:
     st.markdown("### Daily Prices for Top Listings")
     with st.expander("Daily Price Filters", expanded=False):
-        col1, col2, col3 = st.columns(3)
+        col1, col2, col3, col4 = st.columns(4)
         with col1:
             default_daily_years = [year for year in available_custom_years if year in (2024, 2025)]
             if not default_daily_years:
@@ -595,10 +573,12 @@ with tabs[2]:
                 selected_daily_quarters = [quarter_selection]
         with col3:
             selected_daily_channels = st.multiselect("Select Sales Channel(s)", options=sorted(df["Sales Channel"].dropna().unique()), default=[], key="daily_channels", help="Select one or more sales channels to filter the daily price data.")
+        with col4:
+            daily_week_range = st.slider("Select Week Range", min_value=1, max_value=52, value=(1, 52), step=1, key="daily_week_range", help="Select the range of weeks to display in the Daily Prices section.")
     main_listings = ["Pattern Pants", "Pattern Shorts", "Solid Pants", "Solid Shorts", "Patterned Polos"]
     for listing in main_listings:
         st.subheader(listing)
-        fig_daily = create_daily_price_chart(df, listing, selected_daily_years, selected_daily_quarters, selected_daily_channels)
+        fig_daily = create_daily_price_chart(df, listing, selected_daily_years, selected_daily_quarters, selected_daily_channels, week_range=daily_week_range)
         if fig_daily:
             st.plotly_chart(fig_daily, use_container_width=True)
     st.markdown("### Daily Prices Comparison")
@@ -622,19 +602,24 @@ with tabs[2]:
         if fig_comp:
             st.plotly_chart(fig_comp, use_container_width=True)
 
-# -----------------------------------------
+# -------------------------------
 # Tab 4: SKU Trends 
-# -----------------------------------------
+# -------------------------------
 with tabs[3]:
     st.markdown("### SKU Trends")
     if "Product SKU" not in df.columns:
         st.error("The dataset does not contain a 'Product SKU' column.")
     else:
-        with st.expander("SKU Chart Filters", expanded=True):
-            sku_text = st.text_input("Enter Product SKU", value="", key="sku_input", help="Enter a SKU (or part of it) to display its weekly revenue trends.")
-            sku_years = st.multiselect("Select Year(s)", options=available_custom_years, default=default_current_year, key="sku_years", help="Default is the current custom week year.")
-            sku_channels = st.multiselect("Select Sales Channel(s)", options=sorted(df["Sales Channel"].dropna().unique()), default=[], key="sku_channels", help="Select one or more sales channels to filter SKU trends. If empty, all channels are shown.")
-            week_range = st.slider("Select Week Range", min_value=1, max_value=52, value=(1, 52), step=1, key="sku_week_range", help="Select the range of weeks to display.")
+        with st.expander("Chart Filters", expanded=False):
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                sku_text = st.text_input("Enter Product SKU", value="", key="sku_input", help="Enter a SKU (or part of it) to display its weekly revenue trends.")
+            with col2:
+                sku_years = st.multiselect("Select Year(s)", options=available_custom_years, default=default_current_year, key="sku_years", help="Default is the current custom week year.")
+            with col3:
+                sku_channels = st.multiselect("Select Sales Channel(s)", options=sorted(df["Sales Channel"].dropna().unique()), default=[], key="sku_channels", help="Select one or more sales channels to filter SKU trends. If empty, all channels are shown.")
+            with col4:
+                week_range = st.slider("Select Week Range", min_value=1, max_value=52, value=(1, 52), step=1, key="sku_week_range", help="Select the range of weeks to display.")
         
         if sku_text.strip() == "":
             st.info("Please enter a Product SKU to view its trends.")
@@ -664,9 +649,9 @@ with tabs[3]:
             else:
                 st.info("No 'Order Quantity' data available to show units sold.")
 
-# -----------------------------------------
-# Tab 5: Pivot Table
-# -----------------------------------------
+# -------------------------------
+# Tab 5: Pivot Table: Revenue by Week
+# -------------------------------
 with tabs[4]:
     st.markdown("### Pivot Table: Revenue by Week")
     with st.expander("Pivot Table Filters", expanded=False):
@@ -699,9 +684,9 @@ with tabs[4]:
         pivot.columns = pd.MultiIndex.from_tuples(new_columns)
     st.dataframe(pivot, use_container_width=True)
 
-# -----------------------------------------
+# -------------------------------
 # Tab 6: Unrecognised Sales
-# -----------------------------------------
+# -------------------------------
 with tabs[5]:
     st.markdown("### Unrecognised Sales")
     unrecognised_sales = df[df["Listing"].str.contains("unrecognised", case=False, na=False)]
