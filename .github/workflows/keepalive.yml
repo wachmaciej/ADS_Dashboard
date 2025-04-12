@@ -11,5 +11,5 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Ping Streamlit App URL
-        # IMPORTANT: Replace this URL with your actual Streamlit app's URL!
+        # IMPORTANT: Double-check this URL is your correct Streamlit app URL!
         run: curl -sS --fail "https://salesroyal.streamlit.app/" > /dev/null || echo "Ping failed, but continuing."
